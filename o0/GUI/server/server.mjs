@@ -10,7 +10,13 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
-import { getModelsCatalog } from './models-catalog.mjs'
+import {
+  getModelsCatalog,
+  lookupModelPrice,
+  calcTokenCostCa,
+  stripCostFooter,
+  buildCostFooter,
+} from './models-catalog.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GUI_ROOT = path.resolve(__dirname, '..')
@@ -398,7 +404,7 @@ app.post('/api/chat', async (req, res) => {
 
   const apiMessages = session.messages.map(m => ({
     role: m.role,
-    content: m.content,
+    content: stripCostFooter(m.content),
   }))
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -431,6 +437,8 @@ app.post('/api/chat', async (req, res) => {
 
   const assistantId = randomUUID()
   let assistantText = ''
+  /** @type {{ prompt_tokens?: number, completion_tokens?: number, total_tokens?: number } | null} */
+  let usage = null
   send('assistant_start', { id: assistantId })
 
   const baseUrl = normalizeBaseUrl(settings.baseUrl)
@@ -447,6 +455,7 @@ app.post('/api/chat', async (req, res) => {
         model: modelId,
         messages: apiMessages,
         stream: true,
+        stream_options: { include_usage: true },
       }),
     })
 
@@ -491,6 +500,7 @@ app.post('/api/chat', async (req, res) => {
         if (payload === '[DONE]') continue
         try {
           const json = JSON.parse(payload)
+          if (json.usage && typeof json.usage === 'object') usage = json.usage
           const delta =
             json.choices?.[0]?.delta?.content ??
             json.choices?.[0]?.delta?.reasoning_content
@@ -505,11 +515,45 @@ app.post('/api/chat', async (req, res) => {
     }
 
     if (!closed) {
+      const promptTokens = Number(usage?.prompt_tokens) || 0
+      const completionTokens = Number(usage?.completion_tokens) || 0
+      const hasUsage = Boolean(usage)
+      const price = await lookupModelPrice(modelId, {
+        baseUrl: settings.baseUrl,
+        apiKey: settings.apiKey,
+        dataDir: DATA_DIR,
+      })
+      const { costCa } = calcTokenCostCa(price, promptTokens, completionTokens)
+      const priceKnown = costCa != null && hasUsage
+
+      const body = assistantText || '(空回复)'
+      const footer = hasUsage
+        ? buildCostFooter({
+            promptTokens,
+            completionTokens,
+            costCa,
+            priceKnown,
+          })
+        : '费用：本轮用量未返回，无法计价'
+
+      const content = `${body}\n\n---\n${footer}`
+      send('delta', { id: assistantId, text: `\n\n---\n${footer}` })
+
       const assistantMsg = {
         id: assistantId,
         role: 'assistant',
-        content: assistantText || '(空回复)',
+        content,
         createdAt: new Date().toISOString(),
+        model: modelId,
+        usage: hasUsage
+          ? {
+              promptTokens,
+              completionTokens,
+              totalTokens: Number(usage?.total_tokens) || promptTokens + completionTokens,
+              costCa: priceKnown ? costCa : null,
+            }
+          : null,
+        costFooter: footer || null,
       }
       session.messages.push(assistantMsg)
       session.updatedAt = new Date().toISOString()

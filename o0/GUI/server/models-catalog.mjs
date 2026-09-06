@@ -396,3 +396,67 @@ export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false
   }
   return catalog
 }
+
+/// <summary> AI Cursor </summary>
+export async function lookupModelPrice(modelId, opts) {
+  const id = String(modelId || '').trim()
+  if (!id) return null
+  try {
+    const catalog = await getModelsCatalog(opts)
+    const hit = (catalog.models || []).find(m => m.id === id)
+    if (hit?.price) return hit.price
+    for (const tab of catalog.tabs || []) {
+      const m = (tab.models || []).find(x => x.id === id)
+      if (m?.price) return m.price
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/// <summary> AI Cursor </summary>
+export function formatCaAmount(n) {
+  if (!Number.isFinite(n)) return '?'
+  if (n === 0) return '0'
+  if (n > 0 && n < 1e-6) return n.toExponential(2)
+  const s = n.toFixed(6).replace(/\.?0+$/, '')
+  return s || '0'
+}
+
+/// <summary> AI Cursor </summary>
+export function calcTokenCostCa(price, promptTokens, completionTokens) {
+  const pin = Number(promptTokens) || 0
+  const pout = Number(completionTokens) || 0
+  if (!price || price.kind !== 'token')
+    return { costCa: null, inputRate: null, outputRate: null }
+  const unit = String(price.unit || '1K Tokens').toLowerCase()
+  const per = unit.includes('1m') || unit.includes('百万') ? 1_000_000 : 1000
+  const inputRate = Number(price.input) || 0
+  const outputRate = Number(price.output) || 0
+  const costCa = (pin / per) * inputRate + (pout / per) * outputRate
+  return { costCa, inputRate, outputRate, per }
+}
+
+const COST_FOOTER_RE = /\n\n---\n费用：[\s\S]*$/
+
+/// <summary> AI Cursor </summary>
+export function stripCostFooter(content) {
+  return String(content || '').replace(COST_FOOTER_RE, '')
+}
+
+/// <summary> AI Cursor </summary>
+export function buildCostFooter({
+  promptTokens,
+  completionTokens,
+  costCa,
+  priceKnown,
+}) {
+  const pin = Number(promptTokens) || 0
+  const pout = Number(completionTokens) || 0
+  const turnCost =
+    priceKnown && Number.isFinite(costCa)
+      ? `${formatCaAmount(costCa)} CA`
+      : '价格未知'
+  return `费用：入 ${pin} / 出 ${pout} tokens · ${turnCost}`
+}

@@ -1,11 +1,21 @@
 /// <summary> AI Cursor </summary>
 export type ChatRole = 'user' | 'assistant'
 
+export type MessageUsage = {
+  promptTokens: number
+  completionTokens: number
+  totalTokens?: number
+  costCa: number | null
+}
+
 export type ChatMessage = {
   id: string
   role: ChatRole
   content: string
   createdAt: string
+  model?: string
+  usage?: MessageUsage | null
+  costFooter?: string | null
 }
 
 export type SessionSummary = {

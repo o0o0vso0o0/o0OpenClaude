@@ -23,6 +23,17 @@ function formatTime(iso: string) {
   }
 }
 
+/// <summary> AI Cursor </summary>
+function splitCostFooter(content: string): { body: string; cost: string | null } {
+  const marker = '\n\n---\n费用：'
+  const i = content.lastIndexOf(marker)
+  if (i < 0) return { body: content, cost: null }
+  return {
+    body: content.slice(0, i),
+    cost: content.slice(i + '\n\n---\n'.length),
+  }
+}
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -273,28 +284,24 @@ export default function App() {
               <p>在设置中填写 chatanywhere 等 OpenAI 兼容接口的 Base URL 与 API Key，然后发送消息。</p>
             </div>
           )}
-          {messages.map(m => (
-            <div key={m.id} className={`msg ${m.role}`}>
-              <div className="role">{m.role === 'user' ? '你' : '助手'}</div>
-              <div>{m.content || (busy ? '…' : '')}</div>
-            </div>
-          ))}
+          {messages.map(m => {
+            const split =
+              m.role === 'assistant' ? splitCostFooter(m.content || '') : null
+            const body = split ? split.body : m.content
+            const cost = split?.cost || m.costFooter || null
+            return (
+              <div key={m.id} className={`msg ${m.role}`}>
+                <div className="role">{m.role === 'user' ? '你' : '助手'}</div>
+                <div className="msg-body">{body || (busy ? '…' : '')}</div>
+                {cost && <div className="msg-cost">{cost}</div>}
+              </div>
+            )
+          })}
           <div ref={chatEndRef} />
         </div>
 
         <div className="composer">
           {error && <div className="error-banner">{error}</div>}
-          <div className="composer-toolbar">
-            <button
-              type="button"
-              className="btn model-trigger"
-              onClick={() => setModelPickerOpen(true)}
-              title="选择模型"
-            >
-              <span className="model-trigger-label">模型</span>
-              <span className="model-trigger-value">{settings?.model || formModel}</span>
-            </button>
-          </div>
           <div className="composer-row">
             <textarea
               value={input}
