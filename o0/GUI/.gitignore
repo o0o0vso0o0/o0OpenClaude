@@ -1,0 +1,6 @@
+# AI Cursor — OpenClaude local web GUI
+node_modules/
+dist/
+data/
+*.log
+.DS_Store
