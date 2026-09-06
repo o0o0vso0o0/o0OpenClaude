@@ -299,8 +299,8 @@ button {
 }
 
 .modal-wide {
-  width: min(1100px, 96vw);
-  max-height: min(90vh, 920px);
+  /* width moved to .modal.modal-wide (after .modal) to win cascade */
+  max-height: min(92vh, 960px);
   display: flex;
   flex-direction: column;
   padding: 1rem 1.1rem 1.1rem;
@@ -345,8 +345,8 @@ button {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 132px minmax(0, 1fr);
-  gap: 0.65rem;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 0.75rem;
 }
 
 .model-tabs {
@@ -509,6 +509,16 @@ button {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 1.25rem;
+}
+
+/* Must come after .modal — same specificity would otherwise keep 480px */
+.modal.modal-wide {
+  width: min(960px, 92vw);
+  max-width: 92vw;
+  max-height: min(90vh, 900px);
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.1rem 1.1rem;
 }
 
 .modal h2 {
