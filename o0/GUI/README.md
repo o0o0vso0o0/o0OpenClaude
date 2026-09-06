@@ -6,6 +6,7 @@
 
 - 左侧会话列表（右键删除）
 - 中间流式聊天
+- 对话框处选择模型（系列 Tab、按发布日排序、显示输入/输出价）
 - 设置：OpenAI 兼容 API（默认 ChatAnywhere `https://api.chatanywhere.tech/v1`）
 
 ## 一键测试（by o0）

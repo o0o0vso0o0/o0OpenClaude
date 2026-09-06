@@ -13,6 +13,7 @@ import {
   startGuiLifetimeHeartbeat,
   streamChat,
 } from './api'
+import ModelPicker from './ModelPicker'
 
 function formatTime(iso: string) {
   try {
@@ -31,6 +32,7 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [settings, setSettings] = useState<SettingsPublic | null>(null)
   const [formKey, setFormKey] = useState('')
   const [formBase, setFormBase] = useState('https://api.chatanywhere.tech/v1')
@@ -99,12 +101,34 @@ export default function App() {
   }
 
   async function openSettings() {
-    const s = await fetchSettings()
-    setSettings(s)
-    setFormBase(s.baseUrl)
-    setFormModel(s.model)
-    setFormKey(s.apiKey || '')
     setSettingsOpen(true)
+    setError(null)
+    try {
+      const s = await fetchSettings()
+      setSettings(s)
+      setFormBase(s.baseUrl)
+      setFormModel(s.model)
+      setFormKey(s.apiKey || '')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(
+        /network|fetch|failed/i.test(msg)
+          ? '本地服务已断开（NetworkError）。请重新运行「测试 by o0」或 Release 启动后再试。'
+          : msg,
+      )
+    }
+  }
+
+  async function onPickModel(modelId: string) {
+    setError(null)
+    try {
+      const saved = await saveSettings({ model: modelId })
+      setSettings(saved)
+      setFormModel(saved.model)
+      setModelPickerOpen(false)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   async function onSaveSettings() {
@@ -113,7 +137,7 @@ export default function App() {
     try {
       const saved = await saveSettings({
         baseUrl: formBase.trim(),
-        model: formModel.trim(),
+        model: (settings?.model || formModel).trim(),
         apiKey: formKey.trim() || undefined,
       })
       setSettings(saved)
@@ -175,8 +199,13 @@ export default function App() {
         abortRef.current.signal,
       )
     } catch (e) {
-      if ((e as Error).name !== 'AbortError')
-        setError(e instanceof Error ? e.message : String(e))
+      if ((e as Error).name === 'AbortError') return
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(
+        /NetworkError|Failed to fetch|network/i.test(msg)
+          ? '发送失败：本地服务已断开或崩溃。请重新运行「测试 by o0」，并查看 o0\\.cache\\gui-server.log'
+          : msg,
+      )
       setMessages(prev => prev.filter(m => m.id !== assistantId))
     } finally {
       setBusy(false)
@@ -231,7 +260,7 @@ export default function App() {
         <div className="topbar">
           <h1>{title}</h1>
           <div className="sidebar-actions">
-            <button type="button" className="btn btn-ghost" onClick={() => void openSettings()}>
+            <button type="button" className="btn btn-ghost" onClick={() => setModelPickerOpen(true)}>
               {settings?.apiKeySet ? `模型 ${settings.model}` : '未配置 API'}
             </button>
           </div>
@@ -255,6 +284,17 @@ export default function App() {
 
         <div className="composer">
           {error && <div className="error-banner">{error}</div>}
+          <div className="composer-toolbar">
+            <button
+              type="button"
+              className="btn model-trigger"
+              onClick={() => setModelPickerOpen(true)}
+              title="选择模型"
+            >
+              <span className="model-trigger-label">模型</span>
+              <span className="model-trigger-value">{settings?.model || formModel}</span>
+            </button>
+          </div>
           <div className="composer-row">
             <textarea
               value={input}
@@ -275,6 +315,14 @@ export default function App() {
         </div>
       </main>
 
+      {modelPickerOpen && (
+        <ModelPicker
+          currentModel={settings?.model || formModel}
+          onSelect={id => void onPickModel(id)}
+          onClose={() => setModelPickerOpen(false)}
+        />
+      )}
+
       {settingsOpen && (
         <div className="overlay" onClick={() => setSettingsOpen(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -289,14 +337,6 @@ export default function App() {
                 value={formBase}
                 onChange={e => setFormBase(e.target.value)}
                 placeholder="https://api.chatanywhere.tech/v1"
-              />
-            </div>
-            <div className="field">
-              <label>Model</label>
-              <input
-                value={formModel}
-                onChange={e => setFormModel(e.target.value)}
-                placeholder="gpt-4o-mini"
               />
             </div>
             <div className="field">

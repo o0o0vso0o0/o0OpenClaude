@@ -267,6 +267,231 @@ button {
   max-width: 900px;
 }
 
+.composer-toolbar {
+  max-width: 900px;
+  margin: 0 auto 0.55rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.model-trigger {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  max-width: 100%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.35rem 0.85rem;
+}
+
+.model-trigger-label {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.model-trigger-value {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-wide {
+  width: min(1100px, 96vw);
+  max-height: min(90vh, 920px);
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.1rem 1.1rem;
+}
+
+.model-picker-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+  margin-bottom: 0.65rem;
+}
+
+.model-picker-head h2 {
+  margin: 0 0 0.2rem;
+}
+
+.model-picker-head p {
+  margin: 0;
+}
+
+.warn-line {
+  color: #d4a017;
+  margin-bottom: 0.5rem;
+}
+
+.model-search {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+  outline: none;
+  margin-bottom: 0.65rem;
+}
+
+.model-search:focus {
+  border-color: var(--accent);
+}
+
+.model-picker-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 0.65rem;
+}
+
+.model-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0;
+  max-height: none;
+  height: 100%;
+  min-height: 280px;
+  overflow: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+}
+
+.model-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  text-align: left;
+}
+
+.model-tab-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.model-tab-count {
+  color: var(--text);
+  opacity: 0.45;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.model-tab:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.model-tab.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.model-list {
+  flex: 1;
+  min-width: 0;
+  min-height: 280px;
+  height: 100%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.model-row {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.model-row:last-child {
+  border-bottom: 0;
+}
+
+.model-row:hover {
+  background: var(--bg-elevated);
+}
+
+.model-row.selected {
+  background: var(--accent-dim);
+}
+
+.model-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.35rem 1rem;
+  align-items: flex-start;
+}
+
+.model-id {
+  font-family: var(--mono);
+  font-size: 0.88rem;
+  font-weight: 600;
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.model-price {
+  color: var(--accent);
+  font-size: 0.8rem;
+  flex: 1 1 10rem;
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.model-row-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.model-row-meta span {
+  overflow: visible;
+  text-overflow: unset;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.empty-inline {
+  padding: 1.5rem;
+  color: var(--muted);
+  text-align: center;
+}
+
 .overlay {
   position: fixed;
   inset: 0;

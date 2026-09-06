@@ -10,6 +10,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
+import { getModelsCatalog } from './models-catalog.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GUI_ROOT = path.resolve(__dirname, '..')
@@ -24,7 +25,7 @@ const OPEN_BROWSER =
 const LIFETIME =
   !DEV &&
   process.env.OPENCLAUDE_GUI_LIFETIME !== '0'
-const HEARTBEAT_MS = Number(process.env.OPENCLAUDE_GUI_HEARTBEAT_MS || 8000)
+const HEARTBEAT_MS = Number(process.env.OPENCLAUDE_GUI_HEARTBEAT_MS || 45000)
 const HEARTBEAT_CHECK_MS = 1000
 
 const DATA_DIR =
@@ -34,6 +35,7 @@ const DATA_DIR =
 let lastHeartbeatAt = 0
 let shuttingDown = false
 let exitTimer = null
+let activeRequests = 0
 /** @type {import('http').Server | null} */
 let server = null
 
@@ -56,6 +58,11 @@ function scheduleShutdown(reason, delayMs = 2500) {
 /// <summary> AI Cursor </summary>
 function shutdown(reason) {
   if (shuttingDown) return
+  if (activeRequests > 0) {
+    console.log(`[openclaude-gui] skip shutdown (${reason}): ${activeRequests} active request(s)`)
+    touchHeartbeat()
+    return
+  }
   shuttingDown = true
   console.log(`[openclaude-gui] shutting down (${reason})`)
   if (server)
@@ -72,6 +79,8 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   baseUrl: 'https://api.chatanywhere.tech/v1',
   model: 'gpt-4o-mini',
+  /** @type {Record<string, string>} modelId -> ISO last-used time */
+  modelLastUsed: {},
 }
 
 function ensureDirs() {
@@ -84,17 +93,87 @@ function readSettings() {
   ensureDirs()
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'))
-    return { ...DEFAULT_SETTINGS, ...raw }
+    return {
+      ...DEFAULT_SETTINGS,
+      ...raw,
+      modelLastUsed: {
+        ...DEFAULT_SETTINGS.modelLastUsed,
+        ...(raw.modelLastUsed && typeof raw.modelLastUsed === 'object'
+          ? raw.modelLastUsed
+          : {}),
+      },
+    }
   } catch {
-    return { ...DEFAULT_SETTINGS }
+    return { ...DEFAULT_SETTINGS, modelLastUsed: {} }
   }
 }
 
 function writeSettings(next) {
   ensureDirs()
-  const merged = { ...DEFAULT_SETTINGS, ...next }
+  const merged = {
+    ...DEFAULT_SETTINGS,
+    ...next,
+    modelLastUsed: {
+      ...DEFAULT_SETTINGS.modelLastUsed,
+      ...(next.modelLastUsed && typeof next.modelLastUsed === 'object'
+        ? next.modelLastUsed
+        : {}),
+    },
+  }
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(merged, null, 2), 'utf8')
   return merged
+}
+
+/// <summary> AI Cursor </summary>
+function touchModelLastUsed(modelId, settings = null) {
+  const id = String(modelId || '').trim()
+  if (!id) return settings || readSettings()
+  const cur = settings || readSettings()
+  const modelLastUsed = { ...(cur.modelLastUsed || {}) }
+  modelLastUsed[id] = new Date().toISOString()
+  return writeSettings({ ...cur, model: cur.model, modelLastUsed })
+}
+
+/// <summary> AI Cursor </summary>
+function attachFrequentTab(catalog, modelLastUsed) {
+  const used = modelLastUsed && typeof modelLastUsed === 'object' ? modelLastUsed : {}
+  const byId = new Map((catalog.models || []).map(m => [m.id, m]))
+  const frequent = Object.entries(used)
+    .map(([id, at]) => {
+      const base = byId.get(id) || {
+        id,
+        series: 'frequent',
+        created: 0,
+        createdLabel: '',
+        price: null,
+        priceLabel: '价格未知',
+        description: '',
+        fromApi: false,
+        fromPricing: false,
+      }
+      const ts = Date.parse(String(at)) || 0
+      return {
+        ...base,
+        lastUsedAt: String(at),
+        lastUsedLabel: ts
+          ? new Date(ts).toLocaleString()
+          : String(at),
+        lastUsedTs: ts,
+      }
+    })
+    .sort((a, b) => b.lastUsedTs - a.lastUsedTs)
+    .map(({ lastUsedTs, ...rest }) => rest)
+
+  const tabs = [
+    {
+      id: 'frequent',
+      label: '常用',
+      count: frequent.length,
+      models: frequent,
+    },
+    ...(catalog.tabs || []).filter(t => t.id !== 'frequent'),
+  ]
+  return { ...catalog, tabs }
 }
 
 function listSessions() {
@@ -150,6 +229,25 @@ function normalizeBaseUrl(baseUrl) {
 const app = express()
 app.use(cors({ origin: true }))
 app.use(express.json({ limit: '4mb' }))
+app.use((req, _res, next) => {
+  if (req.path.startsWith('/api/')) touchHeartbeat()
+  next()
+})
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next()
+  activeRequests++
+  let settled = false
+  const done = () => {
+    if (settled) return
+    settled = true
+    activeRequests = Math.max(0, activeRequests - 1)
+    touchHeartbeat()
+  }
+  res.on('finish', done)
+  res.on('close', done)
+  next()
+})
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'openclaude-gui', port: PORT })
@@ -166,6 +264,22 @@ app.post('/api/shutdown', (_req, res) => {
   // Delayed so a page refresh can cancel via the next heartbeat.
   scheduleShutdown('client shutdown', 2500)
   res.json({ ok: true, delayedMs: 2500 })
+})
+
+app.get('/api/models', async (req, res) => {
+  try {
+    const settings = readSettings()
+    const force = req.query.refresh === '1' || req.query.refresh === 'true'
+    const catalog = await getModelsCatalog({
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      dataDir: DATA_DIR,
+      force,
+    })
+    res.json(attachFrequentTab(catalog, settings.modelLastUsed))
+  } catch (err) {
+    res.status(502).json({ error: err?.message || String(err) })
+  }
 })
 
 app.get('/api/settings', (_req, res) => {
@@ -189,12 +303,14 @@ app.put('/api/settings', (req, res) => {
     baseUrl: body.baseUrl != null ? String(body.baseUrl).trim() : cur.baseUrl,
     model: body.model != null ? String(body.model).trim() : cur.model,
     apiKey: cur.apiKey,
+    modelLastUsed: { ...(cur.modelLastUsed || {}) },
   }
   if (typeof body.apiKey === 'string') {
     const key = body.apiKey.trim()
     if (key && key !== '********') next.apiKey = key
   }
   if (body.clearApiKey === true) next.apiKey = ''
+  // modelLastUsed only updates on real chat send (/api/chat), not on picker select
   const saved = writeSettings(next)
   const key = saved.apiKey ? String(saved.apiKey) : ''
   res.json({
@@ -262,6 +378,9 @@ app.post('/api/chat', async (req, res) => {
   if (!settings.apiKey || !String(settings.apiKey).trim())
     return res.status(400).json({ error: '请先在设置中填写 API Key' })
 
+  const modelId = settings.model || DEFAULT_SETTINGS.model
+  touchModelLastUsed(modelId, settings)
+
   const userMsg = {
     id: randomUUID(),
     role: 'user',
@@ -271,6 +390,11 @@ app.post('/api/chat', async (req, res) => {
   session.messages.push(userMsg)
   if (session.messages.filter(m => m.role === 'user').length === 1)
     session.title = content.trim().slice(0, 40) || session.title
+  try {
+    writeSession(session)
+  } catch (e) {
+    return res.status(500).json({ error: `保存会话失败: ${e?.message || e}` })
+  }
 
   const apiMessages = session.messages.map(m => ({
     role: m.role,
@@ -282,9 +406,25 @@ app.post('/api/chat', async (req, res) => {
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders?.()
 
+  // IMPORTANT: use res 'close', not req 'close'.
+  // Express has already consumed the POST body; req 'close' often fires immediately
+  // and would abort the upstream stream loop → empty assistant replies.
+  let closed = false
+  res.on('close', () => {
+    closed = true
+  })
+
   const send = (event, data) => {
-    res.write(`event: ${event}\n`)
-    res.write(`data: ${JSON.stringify(data)}\n\n`)
+    if (closed || res.writableEnded) return false
+    try {
+      res.write(`event: ${event}\n`)
+      res.write(`data: ${JSON.stringify(data)}\n\n`)
+      return true
+    } catch (e) {
+      closed = true
+      console.warn('[openclaude-gui] sse write failed:', e?.message || e)
+      return false
+    }
   }
 
   send('user', userMsg)
@@ -304,7 +444,7 @@ app.post('/api/chat', async (req, res) => {
         Authorization: `Bearer ${settings.apiKey}`,
       },
       body: JSON.stringify({
-        model: settings.model || DEFAULT_SETTINGS.model,
+        model: modelId,
         messages: apiMessages,
         stream: true,
       }),
@@ -315,14 +455,14 @@ app.post('/api/chat', async (req, res) => {
       send('error', {
         error: `上游 API ${upstream.status}: ${errText.slice(0, 500)}`,
       })
-      res.end()
+      if (!res.writableEnded) res.end()
       return
     }
 
     const reader = upstream.body?.getReader()
     if (!reader) {
       send('error', { error: '上游无流式响应体' })
-      res.end()
+      if (!res.writableEnded) res.end()
       return
     }
 
@@ -330,8 +470,17 @@ app.post('/api/chat', async (req, res) => {
     let buffer = ''
 
     while (true) {
+      if (closed) {
+        try {
+          await reader.cancel()
+        } catch {
+          /* ignore */
+        }
+        break
+      }
       const { done, value } = await reader.read()
       if (done) break
+      touchHeartbeat()
       buffer += decoder.decode(value, { stream: true })
       const parts = buffer.split('\n')
       buffer = parts.pop() || ''
@@ -342,10 +491,12 @@ app.post('/api/chat', async (req, res) => {
         if (payload === '[DONE]') continue
         try {
           const json = JSON.parse(payload)
-          const delta = json.choices?.[0]?.delta?.content
+          const delta =
+            json.choices?.[0]?.delta?.content ??
+            json.choices?.[0]?.delta?.reasoning_content
           if (delta) {
             assistantText += delta
-            send('delta', { id: assistantId, text: delta })
+            if (!send('delta', { id: assistantId, text: delta })) break
           }
         } catch {
           // ignore partial JSON
@@ -353,25 +504,35 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
-    const assistantMsg = {
-      id: assistantId,
-      role: 'assistant',
-      content: assistantText || '(空回复)',
-      createdAt: new Date().toISOString(),
+    if (!closed) {
+      const assistantMsg = {
+        id: assistantId,
+        role: 'assistant',
+        content: assistantText || '(空回复)',
+        createdAt: new Date().toISOString(),
+      }
+      session.messages.push(assistantMsg)
+      session.updatedAt = new Date().toISOString()
+      writeSession(session)
+      send('done', {
+        message: assistantMsg,
+        session: {
+          id: session.id,
+          title: session.title,
+          updatedAt: session.updatedAt,
+        },
+      })
     }
-    session.messages.push(assistantMsg)
-    session.updatedAt = new Date().toISOString()
-    writeSession(session)
-    send('done', { message: assistantMsg, session: {
-      id: session.id,
-      title: session.title,
-      updatedAt: session.updatedAt,
-    }})
   } catch (err) {
+    console.error('[openclaude-gui] chat error:', err)
     send('error', { error: err?.message || String(err) })
   }
 
-  res.end()
+  try {
+    if (!res.writableEnded) res.end()
+  } catch {
+    /* ignore */
+  }
 })
 
 const distDir = path.join(GUI_ROOT, 'dist')
@@ -386,6 +547,13 @@ app.get(/^(?!\/api).*/, (req, res, next) => {
 })
 
 ensureDirs()
+
+process.on('uncaughtException', err => {
+  console.error('[openclaude-gui] uncaughtException:', err)
+})
+process.on('unhandledRejection', err => {
+  console.error('[openclaude-gui] unhandledRejection:', err)
+})
 
 server = http.createServer(app)
 server.listen(PORT, HOST, () => {

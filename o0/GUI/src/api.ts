@@ -32,6 +32,42 @@ export type SettingsPublic = {
   apiKeyPreview?: string
 }
 
+export type ModelPrice = {
+  kind: string
+  input?: number
+  output?: number
+  label?: string
+  unit?: string
+  note?: string
+}
+
+export type ModelEntry = {
+  id: string
+  series: string
+  created: number
+  createdLabel: string
+  priceLabel: string
+  description: string
+  price: ModelPrice | null
+  lastUsedAt?: string
+  lastUsedLabel?: string
+}
+
+export type ModelsCatalog = {
+  tabs: { id: string; label: string; count: number; models: ModelEntry[] }[]
+  currencyNote?: string
+  pricingUrl?: string
+  fetchedAt?: string
+  apiError?: string | null
+  pricingError?: string | null
+}
+
+/// <summary> AI Cursor </summary>
+export async function fetchModels(refresh = false): Promise<ModelsCatalog> {
+  const q = refresh ? '?refresh=1' : ''
+  return parseJson(await fetch(`/api/models${q}`))
+}
+
 async function parseJson<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -92,18 +128,16 @@ export function startGuiLifetimeHeartbeat(): () => void {
   }
   ping()
   const id = window.setInterval(ping, 2000)
-  const onPageHide = () => {
-    try {
-      // Delayed shutdown on server; refresh cancels via next heartbeat.
-      navigator.sendBeacon('/api/shutdown')
-    } catch {
-      fetch('/api/shutdown', { method: 'POST', keepalive: true }).catch(() => {})
-    }
+  // Do not sendBeacon(/api/shutdown) on pagehide: Firefox/Chrome may fire it on
+  // tab discard / navigation edge cases and kill the local server while the UI
+  // is still open, causing NetworkError on later fetches.
+  const onVis = () => {
+    if (document.visibilityState === 'visible') ping()
   }
-  window.addEventListener('pagehide', onPageHide)
+  document.addEventListener('visibilitychange', onVis)
   return () => {
     window.clearInterval(id)
-    window.removeEventListener('pagehide', onPageHide)
+    document.removeEventListener('visibilitychange', onVis)
   }
 }
 
