@@ -50,12 +50,45 @@ export function classifyStreamPhase(
   const s = String(status || '')
   if (opts?.lastStepKind === 'tool' || /调用工具|tool/i.test(s)) return 'tool'
   if (/正在发送/.test(s)) return 'sending'
-  if (/准备|启动 Agent|恢复会话/.test(s)) return 'boot'
-  if (/首 token|首包|等待本地|等待模型/.test(s)) return 'wait_first'
+  if (/准备|启动 Agent|正在启动|恢复会话|正在恢复/.test(s)) return 'boot'
+  if (
+    /首 token|首包|等待本地|等待模型|正在加载本地|正在连接模型/.test(s)
+  )
+    return 'wait_first'
   if (/思考/.test(s)) return 'thinking'
-  if (/生成|已收到模型响应/.test(s) || opts?.hasContent) return 'generating'
+  if (/生成|写回复|已收到模型响应|正在处理/.test(s) || opts?.hasContent)
+    return 'generating'
   if (opts?.hasContent) return 'generating'
   return 'unknown'
+}
+
+/// <summary> AI Cursor — user-facing wait copy (hide internal pipeline jargon) </summary>
+export function describeStreamWait(opts: {
+  phase: StreamPhase
+  isLocal?: boolean
+}): { title: string; tip?: string } {
+  const local = Boolean(opts.isLocal)
+  switch (opts.phase) {
+    case 'sending':
+      return { title: '正在发送…' }
+    case 'boot':
+      return {
+        title: '正在启动…',
+        tip: local ? '准备本地环境' : '准备运行环境',
+      }
+    case 'wait_first':
+      return local
+        ? { title: '正在加载本地模型…', tip: '第一次会稍慢' }
+        : { title: '正在连接模型…' }
+    case 'thinking':
+      return { title: '正在思考…' }
+    case 'generating':
+      return { title: '正在写回复…' }
+    case 'tool':
+      return { title: '正在处理…' }
+    default:
+      return { title: '处理中…' }
+  }
 }
 
 /// <summary> AI Cursor </summary>

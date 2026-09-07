@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>会话重命名 UI 方案示例</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --bg-panel: #151a21;
+      --bg-elevated: #1c2330;
+      --border: #2a3341;
+      --text: #e6e8eb;
+      --muted: #9aa0a8;
+      --accent: #3d9cf0;
+      --accent-dim: rgba(61, 156, 240, 0.14);
+      --danger: #f85149;
+      --ok: #3fb950;
+      --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+      --mono: ui-monospace, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1a2740 0%, transparent 55%),
+        radial-gradient(900px 500px at 90% 0%, #1a2220 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1.25rem 3rem;
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.55rem;
+      font-weight: 650;
+      margin: 0 0 0.35rem;
+      letter-spacing: -0.02em;
+    }
+    .lead {
+      color: var(--muted);
+      margin: 0 0 1.75rem;
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .lead code {
+      font-family: var(--mono);
+      font-size: 0.85em;
+      color: #c9d1d9;
+      background: var(--bg-elevated);
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1.1rem;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: color-mix(in srgb, var(--bg-panel) 92%, #000);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 420px;
+    }
+    .card-head {
+      padding: 0.95rem 1.05rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+    }
+    .card-head .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.72rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 0.35rem;
+    }
+    .card-head h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+    .card-head p {
+      margin: 0.35rem 0 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    .mock {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      min-height: 280px;
+      background: var(--bg);
+    }
+    .side {
+      border-right: 1px solid var(--border);
+      background: var(--bg-panel);
+      padding: 0.55rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+    .tabs {
+      display: flex;
+      gap: 0.2rem;
+      margin-bottom: 0.35rem;
+    }
+    .tab {
+      flex: 1;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 0.28rem;
+      font-size: 0.7rem;
+      cursor: default;
+    }
+    .tab.on {
+      background: var(--accent-dim);
+      border-color: rgba(61, 156, 240, 0.3);
+      color: var(--text);
+    }
+    .sess {
+      position: relative;
+      text-align: left;
+      width: 100%;
+      border: 1px solid transparent;
+      background: transparent;
+      border-radius: 8px;
+      padding: 0.5rem 0.55rem;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    .sess:hover { background: var(--bg-elevated); }
+    .sess.on {
+      background: var(--accent-dim);
+      border-color: rgba(61, 156, 240, 0.35);
+    }
+    .sess .t {
+      font-size: 0.78rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sess .m {
+      font-size: 0.68rem;
+      color: var(--muted);
+      margin-top: 0.15rem;
+    }
+    .sess input.rename {
+      width: 100%;
+      font: inherit;
+      font-size: 0.78rem;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--accent);
+      border-radius: 5px;
+      padding: 0.2rem 0.35rem;
+      outline: none;
+    }
+    .main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.7rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      min-height: 48px;
+    }
+    .topbar h3 {
+      margin: 0;
+      font-size: 0.95rem;
+      font-weight: 600;
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .topbar input.rename {
+      flex: 1;
+      min-width: 0;
+      font: inherit;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--bg-elevated);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      padding: 0.25rem 0.45rem;
+      outline: none;
+    }
+    .chat {
+      flex: 1;
+      padding: 0.85rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+    .bubble {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.65rem 0.75rem;
+      max-width: 92%;
+      color: #c9cdd3;
+    }
+    .icon-btn {
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 0.85rem;
+      flex-shrink: 0;
+    }
+    .icon-btn:hover {
+      color: var(--accent);
+      border-color: rgba(61, 156, 240, 0.45);
+    }
+    .icon-btn.ghost {
+      background: transparent;
+      border-color: transparent;
+    }
+    .more {
+      position: absolute;
+      right: 0.35rem;
+      top: 0.4rem;
+      opacity: 0;
+      transition: opacity 0.12s;
+    }
+    .sess:hover .more,
+    .sess.menu-open .more { opacity: 1; }
+    .menu {
+      position: absolute;
+      right: 0.25rem;
+      top: 2rem;
+      z-index: 5;
+      min-width: 118px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.25rem;
+      box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+      display: none;
+    }
+    .sess.menu-open .menu { display: block; }
+    .menu button {
+      display: block;
+      width: 100%;
+      text-align: left;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.75rem;
+      padding: 0.4rem 0.5rem;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    .menu button:hover { background: var(--accent-dim); color: var(--accent); }
+    .menu button.danger:hover { background: rgba(248,81,73,0.12); color: var(--danger); }
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 1.25rem;
+      transform: translateX(-50%) translateY(120%);
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.55rem 0.9rem;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+      transition: transform 0.2s ease;
+      z-index: 50;
+      pointer-events: none;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+    .hint {
+      margin-top: auto;
+      padding: 0.55rem 0.85rem 0.75rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.75rem;
+      color: var(--muted);
+      background: color-mix(in srgb, var(--bg-panel) 80%, transparent);
+    }
+    .hint strong { color: #c9cdd3; font-weight: 600; }
+    .foot {
+      margin-top: 1.5rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>会话重命名 · UI 方案示例</h1>
+    <p class="lead">
+      可交互预览（不连后端）。在各卡片内按说明操作。风格贴近 OpenClaude GUI 侧栏。
+      文件：<code>o0/Temp/session-rename-ui-demos.html</code>
+    </p>
+
+    <div class="grid">
+      <!-- A -->
+      <section class="card" data-scheme="A">
+        <div class="card-head">
+          <div class="badge">方案 A · 推荐</div>
+          <h2>双击标题就地编辑</h2>
+          <p>侧栏会话名或顶栏大标题双击 → 输入框；Enter 保存，Esc 取消。</p>
+        </div>
+        <div class="mock">
+          <aside class="side">
+            <div class="tabs"><span class="tab on">进行中</span><span class="tab">遗弃</span></div>
+            <button type="button" class="sess on" data-id="a1" data-title="腿部 IK 调参">
+              <div class="t">腿部 IK 调参</div>
+              <div class="m">刚刚</div>
+            </button>
+            <button type="button" class="sess" data-id="a2" data-title="本地 BF16 冒烟">
+              <div class="t">本地 BF16 冒烟</div>
+              <div class="m">2 小时前</div>
+            </button>
+          </aside>
+          <div class="main">
+            <div class="topbar">
+              <h3 class="title-view" title="双击重命名">腿部 IK 调参</h3>
+            </div>
+            <div class="chat"><div class="bubble">双击左侧会话名，或双击上方标题试试。</div></div>
+          </div>
+        </div>
+        <div class="hint"><strong>操作：</strong>双击侧栏标题或顶栏标题</div>
+      </section>
+
+      <!-- B -->
+      <section class="card" data-scheme="B">
+        <div class="card-head">
+          <div class="badge">方案 B</div>
+          <h2>悬停「⋯」菜单</h2>
+          <p>悬停会话行出现 ⋯ → 重命名 / 移入遗弃。不和拖拽抢双击手势。</p>
+        </div>
+        <div class="mock">
+          <aside class="side">
+            <div class="tabs"><span class="tab on">进行中</span><span class="tab">遗弃</span></div>
+            <button type="button" class="sess on" data-id="b1" data-title="OpenClaude GUI">
+              <div class="t">OpenClaude GUI</div>
+              <div class="m">昨天</div>
+              <span class="more icon-btn ghost" title="更多" aria-label="更多">⋯</span>
+              <div class="menu">
+                <button type="button" data-act="rename">重命名</button>
+                <button type="button" data-act="discard">移入遗弃</button>
+              </div>
+            </button>
+            <button type="button" class="sess" data-id="b2" data-title="费用明细核对">
+              <div class="t">费用明细核对</div>
+              <div class="m">3 天前</div>
+              <span class="more icon-btn ghost" title="更多" aria-label="更多">⋯</span>
+              <div class="menu">
+                <button type="button" data-act="rename">重命名</button>
+                <button type="button" class="danger" data-act="discard">移入遗弃</button>
+              </div>
+            </button>
+          </aside>
+          <div class="main">
+            <div class="topbar"><h3>OpenClaude GUI</h3></div>
+            <div class="chat"><div class="bubble">把鼠标移到左侧会话行，点右上角 ⋯ → 重命名。</div></div>
+          </div>
+        </div>
+        <div class="hint"><strong>操作：</strong>悬停会话 → ⋯ → 重命名</div>
+      </section>
+
+      <!-- C -->
+      <section class="card" data-scheme="C">
+        <div class="card-head">
+          <div class="badge">方案 C</div>
+          <h2>顶栏铅笔按钮</h2>
+          <p>只改当前打开会话。实现简单，不碰侧栏拖拽。可与 A 组合。</p>
+        </div>
+        <div class="mock">
+          <aside class="side">
+            <div class="tabs"><span class="tab on">进行中</span><span class="tab">遗弃</span></div>
+            <button type="button" class="sess on" data-id="c1" data-title="木方块原点导出">
+              <div class="t">木方块原点导出</div>
+              <div class="m">今天</div>
+            </button>
+            <button type="button" class="sess" data-id="c2" data-title="新会话">
+              <div class="t">新会话</div>
+              <div class="m">周一</div>
+            </button>
+          </aside>
+          <div class="main">
+            <div class="topbar">
+              <h3 class="title-view">木方块原点导出</h3>
+              <button type="button" class="icon-btn pencil" title="重命名">✎</button>
+            </div>
+            <div class="chat"><div class="bubble">点顶栏标题旁的铅笔进入编辑。</div></div>
+          </div>
+        </div>
+        <div class="hint"><strong>操作：</strong>点顶栏 ✎</div>
+      </section>
+
+      <!-- D -->
+      <section class="card" data-scheme="D">
+        <div class="card-head">
+          <div class="badge">方案 D</div>
+          <h2>慢双击 / 选中后再点</h2>
+          <p>第一次点击选中；约 0.5s 后再点同一项进入编辑（类似资源管理器）。</p>
+        </div>
+        <div class="mock">
+          <aside class="side">
+            <div class="tabs"><span class="tab on">进行中</span><span class="tab">遗弃</span></div>
+            <button type="button" class="sess on" data-id="d1" data-title="Agent 活动条">
+              <div class="t">Agent 活动条</div>
+              <div class="m">1 小时前</div>
+            </button>
+            <button type="button" class="sess" data-id="d2" data-title="遗弃分组拖拽">
+              <div class="t">遗弃分组拖拽</div>
+              <div class="m">周五</div>
+            </button>
+          </aside>
+          <div class="main">
+            <div class="topbar"><h3>Agent 活动条</h3></div>
+            <div class="chat"><div class="bubble">先点选会话，稍等再点一次同一会话名进入重命名（不要快速双击）。</div></div>
+          </div>
+        </div>
+        <div class="hint"><strong>操作：</strong>单击选中 → 停顿 → 再单击标题文字进入编辑</div>
+      </section>
+    </div>
+
+    <p class="foot">选好方案后告诉我编号（可组合，如 A+C），再接到正式 GUI。</p>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const toastEl = document.getElementById('toast')
+    let toastTimer = 0
+    function toast(msg) {
+      toastEl.textContent = msg
+      toastEl.classList.add('show')
+      clearTimeout(toastTimer)
+      toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1600)
+    }
+
+    function setActiveSession(card, sessBtn) {
+      card.querySelectorAll('.sess').forEach(s => s.classList.remove('on'))
+      sessBtn.classList.add('on')
+      const title = sessBtn.dataset.title || sessBtn.querySelector('.t')?.textContent || ''
+      const h3 = card.querySelector('.topbar h3, .topbar .title-view')
+      if (h3 && h3.tagName !== 'INPUT') h3.textContent = title
+      const input = card.querySelector('.topbar input.rename')
+      if (input) input.value = title
+    }
+
+    function beginRename(card, source, initial) {
+      const text = (initial ?? source.dataset?.title ?? source.textContent ?? '').trim()
+      if (source.classList?.contains('sess')) {
+        const t = source.querySelector('.t')
+        if (!t || source.querySelector('input.rename')) return
+        const input = document.createElement('input')
+        input.className = 'rename'
+        input.value = text
+        t.replaceWith(input)
+        input.focus()
+        input.select()
+        const commit = (ok) => {
+          const next = ok ? (input.value.trim() || text) : text
+          source.dataset.title = next
+          const div = document.createElement('div')
+          div.className = 't'
+          div.textContent = next
+          input.replaceWith(div)
+          if (source.classList.contains('on')) {
+            const h3 = card.querySelector('.topbar h3, .topbar .title-view')
+            if (h3 && h3.tagName !== 'INPUT') h3.textContent = next
+          }
+          if (ok && next !== text) toast(`已重命名：${next}`)
+        }
+        input.addEventListener('keydown', e => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(true) }
+          if (e.key === 'Escape') { e.preventDefault(); commit(false) }
+        })
+        input.addEventListener('blur', () => commit(true))
+        return
+      }
+      // topbar title
+      const topbar = card.querySelector('.topbar')
+      const view = topbar.querySelector('h3, .title-view')
+      if (!view || topbar.querySelector('input.rename')) return
+      const input = document.createElement('input')
+      input.className = 'rename'
+      input.value = text || view.textContent
+      view.replaceWith(input)
+      input.focus()
+      input.select()
+      const commit = (ok) => {
+        const next = ok ? (input.value.trim() || text) : (text || view.textContent)
+        const h3 = document.createElement('h3')
+        h3.className = view.className || 'title-view'
+        h3.textContent = next
+        if (card.dataset.scheme === 'A') h3.title = '双击重命名'
+        input.replaceWith(h3)
+        bindTopbarA(card)
+        const on = card.querySelector('.sess.on')
+        if (on) {
+          on.dataset.title = next
+          const t = on.querySelector('.t')
+          if (t) t.textContent = next
+        }
+        if (card.dataset.scheme === 'C') {
+          // re-bind pencil stays
+        }
+        if (ok && next !== text) toast(`已重命名：${next}`)
+      }
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(true) }
+        if (e.key === 'Escape') { e.preventDefault(); commit(false) }
+      })
+      input.addEventListener('blur', () => commit(true))
+    }
+
+    function bindTopbarA(card) {
+      const h3 = card.querySelector('.topbar h3, .topbar .title-view')
+      if (!h3 || h3.tagName === 'INPUT') return
+      h3.ondblclick = e => {
+        e.preventDefault()
+        beginRename(card, h3, h3.textContent)
+      }
+    }
+
+    // Scheme A
+    document.querySelectorAll('[data-scheme="A"]').forEach(card => {
+      card.querySelectorAll('.sess').forEach(sess => {
+        sess.addEventListener('click', () => setActiveSession(card, sess))
+        sess.addEventListener('dblclick', e => {
+          e.preventDefault()
+          e.stopPropagation()
+          beginRename(card, sess, sess.dataset.title)
+        })
+      })
+      bindTopbarA(card)
+    })
+
+    // Scheme B
+    document.querySelectorAll('[data-scheme="B"]').forEach(card => {
+      card.querySelectorAll('.sess').forEach(sess => {
+        sess.addEventListener('click', e => {
+          if (e.target.closest('.more, .menu')) return
+          card.querySelectorAll('.sess').forEach(s => s.classList.remove('menu-open'))
+          setActiveSession(card, sess)
+        })
+        const more = sess.querySelector('.more')
+        more?.addEventListener('click', e => {
+          e.stopPropagation()
+          const open = sess.classList.contains('menu-open')
+          card.querySelectorAll('.sess').forEach(s => s.classList.remove('menu-open'))
+          if (!open) sess.classList.add('menu-open')
+        })
+        sess.querySelectorAll('.menu [data-act]').forEach(btn => {
+          btn.addEventListener('click', e => {
+            e.stopPropagation()
+            sess.classList.remove('menu-open')
+            const act = btn.dataset.act
+            if (act === 'rename') beginRename(card, sess, sess.dataset.title)
+            if (act === 'discard') toast(`示例：移入遗弃「${sess.dataset.title}」`)
+          })
+        })
+      })
+      document.addEventListener('click', e => {
+        if (!e.target.closest('[data-scheme="B"] .sess'))
+          card.querySelectorAll('.sess').forEach(s => s.classList.remove('menu-open'))
+      })
+    })
+
+    // Scheme C
+    document.querySelectorAll('[data-scheme="C"]').forEach(card => {
+      card.querySelectorAll('.sess').forEach(sess => {
+        sess.addEventListener('click', () => setActiveSession(card, sess))
+      })
+      card.querySelector('.pencil')?.addEventListener('click', () => {
+        const h3 = card.querySelector('.topbar h3, .topbar .title-view')
+        if (h3) beginRename(card, h3, h3.textContent)
+      })
+    })
+
+    // Scheme D — slow second click
+    document.querySelectorAll('[data-scheme="D"]').forEach(card => {
+      let lastId = null
+      let lastAt = 0
+      card.querySelectorAll('.sess').forEach(sess => {
+        sess.addEventListener('click', e => {
+          const now = Date.now()
+          const id = sess.dataset.id
+          const gap = now - lastAt
+          if (id === lastId && gap > 350 && gap < 1200) {
+            // second deliberate click → rename
+            e.preventDefault()
+            beginRename(card, sess, sess.dataset.title)
+            lastId = null
+            lastAt = 0
+            return
+          }
+          setActiveSession(card, sess)
+          lastId = id
+          lastAt = now
+        })
+      })
+    })
+  </script>
+</body>
+</html>

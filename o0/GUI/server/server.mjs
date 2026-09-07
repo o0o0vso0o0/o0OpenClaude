@@ -281,22 +281,36 @@ function attachFrequentTab(catalog, modelLastUsed) {
   return { ...catalog, tabs }
 }
 
-function listSessions() {
+function listSessions(filterStatus = 'all') {
   ensureDirs()
   const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'))
   const sessions = files.map(f => {
     const full = path.join(SESSIONS_DIR, f)
     const data = JSON.parse(fs.readFileSync(full, 'utf8'))
+    const status =
+      data.status === 'discarded' ? 'discarded' : 'active'
     return {
       id: data.id,
       title: data.title || '新会话',
       updatedAt: data.updatedAt || data.createdAt,
       createdAt: data.createdAt,
       messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
+      status,
+      discardedAt: data.discardedAt || null,
     }
   })
-  sessions.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
-  return sessions
+  const filtered =
+    filterStatus === 'active' || filterStatus === 'discarded'
+      ? sessions.filter(s => s.status === filterStatus)
+      : sessions
+  filtered.sort((a, b) => {
+    if (filterStatus === 'discarded')
+      return String(b.discardedAt || b.updatedAt).localeCompare(
+        String(a.discardedAt || a.updatedAt),
+      )
+    return String(b.updatedAt).localeCompare(String(a.updatedAt))
+  })
+  return filtered
 }
 
 function sessionPath(id) {
@@ -653,8 +667,9 @@ app.put('/api/settings', async (req, res) => {
   res.json(settingsPublic(saved))
 })
 
-app.get('/api/sessions', (_req, res) => {
-  res.json({ sessions: listSessions() })
+app.get('/api/sessions', (req, res) => {
+  const status = String(req.query.status || 'all').trim()
+  res.json({ sessions: listSessions(status) })
 })
 
 app.post('/api/sessions', (req, res) => {
@@ -666,6 +681,8 @@ app.post('/api/sessions', (req, res) => {
     title,
     createdAt: now,
     updatedAt: now,
+    status: 'active',
+    discardedAt: null,
     messages: [],
   }
   writeSession(session)
@@ -675,6 +692,7 @@ app.post('/api/sessions', (req, res) => {
 app.get('/api/sessions/:id', (req, res) => {
   const session = readSession(req.params.id)
   if (!session) return res.status(404).json({ error: 'session not found' })
+  if (!session.status) session.status = 'active'
   res.json(session)
 })
 
@@ -683,16 +701,56 @@ app.patch('/api/sessions/:id', (req, res) => {
   if (!session) return res.status(404).json({ error: 'session not found' })
   if (typeof req.body?.title === 'string' && req.body.title.trim())
     session.title = req.body.title.trim()
+  if (req.body?.status === 'active' || req.body?.status === 'discarded') {
+    session.status = req.body.status
+    if (req.body.status === 'discarded')
+      session.discardedAt = new Date().toISOString()
+    else session.discardedAt = null
+  }
   session.updatedAt = new Date().toISOString()
   writeSession(session)
   res.json(session)
 })
 
+/// <summary> AI Cursor — soft delete: move to discarded group </summary>
+app.post('/api/sessions/:id/discard', (req, res) => {
+  const session = readSession(req.params.id)
+  if (!session) return res.status(404).json({ error: 'session not found' })
+  session.status = 'discarded'
+  session.discardedAt = new Date().toISOString()
+  session.updatedAt = session.discardedAt
+  writeSession(session)
+  res.json(session)
+})
+
+/// <summary> AI Cursor — restore from discarded to active </summary>
+app.post('/api/sessions/:id/restore', (req, res) => {
+  const session = readSession(req.params.id)
+  if (!session) return res.status(404).json({ error: 'session not found' })
+  session.status = 'active'
+  session.discardedAt = null
+  session.updatedAt = new Date().toISOString()
+  writeSession(session)
+  res.json(session)
+})
+
+/// <summary> AI Cursor — permanent delete (default soft via /discard) </summary>
 app.delete('/api/sessions/:id', (req, res) => {
+  const permanent =
+    String(req.query.permanent || '') === '1' ||
+    req.query.permanent === 'true'
+  const session = readSession(req.params.id)
+  if (!session) return res.status(404).json({ error: 'session not found' })
+  if (!permanent) {
+    session.status = 'discarded'
+    session.discardedAt = new Date().toISOString()
+    session.updatedAt = session.discardedAt
+    writeSession(session)
+    return res.json({ ok: true, discarded: true, session })
+  }
   const p = sessionPath(req.params.id)
-  if (!fs.existsSync(p)) return res.status(404).json({ error: 'session not found' })
   fs.unlinkSync(p)
-  res.json({ ok: true })
+  res.json({ ok: true, permanent: true })
 })
 
 /// <summary> AI Cursor </summary>
@@ -816,6 +874,8 @@ app.post('/api/chat', async (req, res) => {
     usageLike,
     usageDetail = null,
     thinkingText = null,
+    activity = null,
+    filesChanged = null,
   ) {
     const promptTokens = Number(usageLike?.promptTokens ?? usageLike?.prompt_tokens) || 0
     const completionTokens =
@@ -849,6 +909,10 @@ app.post('/api/chat', async (req, res) => {
       createdAt: new Date().toISOString(),
       model: modelId,
       ...(thinkingText ? { thinking: String(thinkingText) } : {}),
+      ...(Array.isArray(activity) && activity.length ? { activity } : {}),
+      ...(Array.isArray(filesChanged) && filesChanged.length
+        ? { filesChanged }
+        : {}),
       usage: hasCounts
         ? {
             promptTokens,
@@ -884,9 +948,7 @@ app.post('/api/chat', async (req, res) => {
   send('assistant_start', { id: assistantId })
   send('status', {
     id: assistantId,
-    text: /11434|ollama/i.test(String(settings.baseUrl || ''))
-      ? '正在准备本地 Agent 调用…'
-      : '正在准备 Agent 调用…',
+    text: '正在启动…',
   })
 
   const baseUrl = normalizeBaseUrl(settings.baseUrl)
@@ -946,6 +1008,19 @@ app.post('/api/chat', async (req, res) => {
           send('thinking', { id: assistantId, text: ev.text })
         } else if (ev.type === 'thinking_done') {
           send('thinking_done', { id: assistantId })
+        } else if (ev.type === 'activity' && ev.kind && ev.text) {
+          send('activity', {
+            id: assistantId,
+            kind: ev.kind,
+            text: ev.text,
+            active: Boolean(ev.active),
+            ms: typeof ev.ms === 'number' ? ev.ms : undefined,
+          })
+        } else if (ev.type === 'files_changed' && Array.isArray(ev.files)) {
+          send('files_changed', {
+            id: assistantId,
+            files: ev.files,
+          })
         }
       },
     })
@@ -959,6 +1034,8 @@ app.post('/api/chat', async (req, res) => {
         result.usage,
         result.usageDetail || null,
         assistantThinking || null,
+        result.activity || null,
+        result.filesChanged || null,
       )
   } catch (err) {
     console.error('[openclaude-gui] chat error:', err)

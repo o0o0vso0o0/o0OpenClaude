@@ -9,6 +9,17 @@ import {
   analyzeSessionJsonl,
   buildUsageDetail,
 } from './usage-analysis.mjs'
+import {
+  categorizeToolName,
+  emptyToolCounts,
+  extractFileChangeFromToolResult,
+  formatCommandsSummary,
+  formatEditedSummary,
+  formatExploredSummary,
+  formatThoughtFor,
+  formatWorkedFor,
+  toolInputFilePath,
+} from './agent-activity.mjs'
 
 /// <summary> AI Cursor </summary>
 export function resolveOpenClaudeCli(guiRoot) {
@@ -240,15 +251,159 @@ function runAgentTurnOnce(opts) {
     let contextRequested = false
     let lastThinkingStatusAt = 0
     let inThinkingBlock = false
+    const turnStartedAt = Date.now()
+    let thinkingStartedAt = 0
+    let thinkingMs = 0
+    const toolCounts = emptyToolCounts()
+    /** @type {Map<string, { filePath: string, added: number, removed: number }>} */
+    const filesChangedMap = new Map()
+    /** @type {Map<string, { name: string, input: object }>} */
+    const pendingTools = new Map()
+
+    /// <summary> AI Cursor </summary>
+    function filesChangedList() {
+      return [...filesChangedMap.values()].map(f => ({
+        filePath: f.filePath,
+        added: f.added,
+        removed: f.removed,
+      }))
+    }
+
+    /// <summary> AI Cursor </summary>
+    function emitActivitySummaries({ active = true } = {}) {
+      const explored = formatExploredSummary(toolCounts, { active })
+      if (explored)
+        onEvent({ type: 'activity', kind: 'explored', text: explored, active })
+      const edited = formatEditedSummary(toolCounts, { active })
+      if (edited)
+        onEvent({ type: 'activity', kind: 'edited', text: edited, active })
+      const cmds = formatCommandsSummary(toolCounts, { active })
+      if (cmds)
+        onEvent({ type: 'activity', kind: 'commands', text: cmds, active })
+      const files = filesChangedList()
+      if (files.length)
+        onEvent({ type: 'files_changed', files })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function noteThinkingStart() {
+      if (!thinkingStartedAt) thinkingStartedAt = Date.now()
+      inThinkingBlock = true
+    }
+
+    /// <summary> AI Cursor </summary>
+    function noteThinkingDone() {
+      if (!inThinkingBlock && !thinkingStartedAt) return
+      if (thinkingStartedAt) {
+        thinkingMs += Math.max(0, Date.now() - thinkingStartedAt)
+        thinkingStartedAt = 0
+      }
+      inThinkingBlock = false
+      onEvent({ type: 'thinking_done' })
+      if (thinkingMs > 0)
+        onEvent({
+          type: 'activity',
+          kind: 'thought',
+          text: formatThoughtFor(thinkingMs),
+          active: false,
+        })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function registerToolUse(id, name, input) {
+      const toolId = id || `${name}-${seenTools.size}`
+      if (seenTools.has(toolId)) return
+      seenTools.add(toolId)
+      const inp = input && typeof input === 'object' ? input : {}
+      pendingTools.set(toolId, { name: name || 'Tool', input: inp })
+      const cat = categorizeToolName(name)
+      if (cat in toolCounts) toolCounts[cat] += 1
+      const fileHint = toolInputFilePath(inp)
+      if (cat === 'writes' && fileHint && !filesChangedMap.has(fileHint))
+        filesChangedMap.set(fileHint, {
+          filePath: fileHint,
+          added: 0,
+          removed: 0,
+        })
+      onEvent({
+        type: 'tool',
+        id: toolId,
+        name: name || 'Tool',
+        preview: toolPreview(inp),
+      })
+      emitActivitySummaries({ active: true })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function ingestToolResultPayload(payload, toolUseId) {
+      const change = extractFileChangeFromToolResult(payload)
+      if (change) {
+        const prev = filesChangedMap.get(change.filePath)
+        filesChangedMap.set(change.filePath, {
+          filePath: change.filePath,
+          added: (prev?.added || 0) + (change.added || 0),
+          removed: (prev?.removed || 0) + (change.removed || 0),
+        })
+        onEvent({ type: 'files_changed', files: filesChangedList() })
+        return
+      }
+      if (!toolUseId || !pendingTools.has(toolUseId)) return
+      const pending = pendingTools.get(toolUseId)
+      if (categorizeToolName(pending.name) !== 'writes') return
+      const fp = toolInputFilePath(pending.input)
+      if (fp && !filesChangedMap.has(fp))
+        filesChangedMap.set(fp, { filePath: fp, added: 0, removed: 0 })
+      if (fp) onEvent({ type: 'files_changed', files: filesChangedList() })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function handleUserToolResults(msg) {
+      const top =
+        msg.tool_use_result ||
+        msg.toolUseResult ||
+        msg.toolUseResult?.data ||
+        null
+      if (top && typeof top === 'object')
+        ingestToolResultPayload(top, msg.tool_use_id || msg.toolUseID)
+      const content = msg.message?.content
+      if (!Array.isArray(content)) return
+      for (const block of content) {
+        if (block?.type !== 'tool_result') continue
+        const toolUseId = block.tool_use_id || block.toolUseID
+        let payload = block.toolUseResult || block.tool_use_result
+        if (!payload && typeof block.content === 'string') {
+          try {
+            const parsed = JSON.parse(block.content)
+            if (parsed && typeof parsed === 'object') payload = parsed
+          } catch {
+            /* ignore */
+          }
+        } else if (!payload && Array.isArray(block.content)) {
+          for (const part of block.content) {
+            if (part?.type === 'text' && typeof part.text === 'string') {
+              try {
+                const parsed = JSON.parse(part.text)
+                if (parsed && typeof parsed === 'object') {
+                  payload = parsed
+                  break
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+        } else if (!payload && block.content && typeof block.content === 'object')
+          payload = block.content
+        if (payload) ingestToolResultPayload(payload, toolUseId)
+      }
+    }
 
     const localHint =
       /11434|ollama/i.test(String(baseUrl || '')) ||
       /^qwen3\.8:/i.test(String(model || ''))
     onEvent({
       type: 'status',
-      text: resumeId
-        ? '正在恢复会话并启动 Agent…'
-        : '正在启动 Agent…',
+      text: resumeId ? '正在恢复会话…' : '正在启动…',
     })
 
     const child = spawn(cli.node, args, {
@@ -260,9 +415,7 @@ function runAgentTurnOnce(opts) {
 
     onEvent({
       type: 'status',
-      text: localHint
-        ? '已启动，等待本地模型首 token（冷启动可能较久）…'
-        : '已启动，等待模型首包…',
+      text: localHint ? '正在加载本地模型…' : '正在连接模型…',
     })
 
     const finish = (err, value) => {
@@ -414,6 +567,50 @@ function runAgentTurnOnce(opts) {
           typeof resultMsg?.total_cost_usd === 'number'
             ? resultMsg.total_cost_usd
             : null,
+        ...(() => {
+          if (thinkingStartedAt) {
+            thinkingMs += Math.max(0, Date.now() - thinkingStartedAt)
+            thinkingStartedAt = 0
+          }
+          const workedMs = Math.max(0, Date.now() - turnStartedAt)
+          const items = []
+          if (thinkingMs > 0)
+            items.push({
+              kind: 'thought',
+              text: formatThoughtFor(thinkingMs),
+              active: false,
+            })
+          const explored = formatExploredSummary(toolCounts, { active: false })
+          if (explored)
+            items.push({ kind: 'explored', text: explored, active: false })
+          const edited = formatEditedSummary(toolCounts, { active: false })
+          if (edited)
+            items.push({ kind: 'edited', text: edited, active: false })
+          const cmds = formatCommandsSummary(toolCounts, { active: false })
+          if (cmds)
+            items.push({ kind: 'commands', text: cmds, active: false })
+          const workedText = formatWorkedFor(workedMs)
+          items.push({
+            kind: 'worked',
+            text: workedText,
+            active: false,
+            ms: workedMs,
+          })
+          onEvent({
+            type: 'activity',
+            kind: 'worked',
+            text: workedText,
+            active: false,
+            ms: workedMs,
+          })
+          emitActivitySummaries({ active: false })
+          return {
+            activity: items,
+            filesChanged: filesChangedList(),
+            workedMs,
+            thinkingMs,
+          }
+        })(),
         cli: cli.label,
         exitCode,
         ok: Boolean(ok || assistantText),
@@ -466,13 +663,19 @@ function runAgentTurnOnce(opts) {
             ev.delta.text ||
             ''
           if (chunk) {
-            inThinkingBlock = true
+            noteThinkingStart()
             onEvent({ type: 'thinking', text: String(chunk) })
           }
           const now = Date.now()
           if (now - lastThinkingStatusAt > 1500) {
             lastThinkingStatusAt = now
-            onEvent({ type: 'status', text: '模型思考中…' })
+            onEvent({ type: 'status', text: '正在思考…' })
+            onEvent({
+              type: 'activity',
+              kind: 'thought',
+              text: 'Thinking…',
+              active: true,
+            })
           }
         }
         if (
@@ -480,22 +683,23 @@ function runAgentTurnOnce(opts) {
           (ev.content_block?.type === 'thinking' ||
             ev.content_block?.type === 'reasoning')
         ) {
-          inThinkingBlock = true
-          onEvent({ type: 'status', text: '模型开始思考…' })
+          noteThinkingStart()
+          onEvent({ type: 'status', text: '正在思考…' })
+          onEvent({
+            type: 'activity',
+            kind: 'thought',
+            text: 'Thinking…',
+            active: true,
+          })
         }
-        if (ev.type === 'content_block_stop' && inThinkingBlock) {
-          inThinkingBlock = false
-          onEvent({ type: 'thinking_done' })
-        }
+        if (ev.type === 'content_block_stop' && inThinkingBlock)
+          noteThinkingDone()
         if (
           ev.type === 'content_block_delta' &&
           ev.delta?.type === 'text_delta' &&
           ev.delta.text
         ) {
-          if (inThinkingBlock) {
-            inThinkingBlock = false
-            onEvent({ type: 'thinking_done' })
-          }
+          if (inThinkingBlock) noteThinkingDone()
           assistantText += ev.delta.text
           onEvent({ type: 'delta', text: ev.delta.text })
         }
@@ -503,24 +707,17 @@ function runAgentTurnOnce(opts) {
           ev.type === 'content_block_start' &&
           ev.content_block?.type === 'tool_use'
         ) {
-          if (inThinkingBlock) {
-            inThinkingBlock = false
-            onEvent({ type: 'thinking_done' })
-          }
+          if (inThinkingBlock) noteThinkingDone()
           const tu = ev.content_block
-          const id = tu.id || `${tu.name}-${seenTools.size}`
-          if (!seenTools.has(id)) {
-            seenTools.add(id)
-            onEvent({
-              type: 'tool',
-              id,
-              name: tu.name || 'Tool',
-              preview: toolPreview(tu.input),
-            })
-          }
+          registerToolUse(tu.id, tu.name || 'Tool', tu.input)
         }
         if (ev.type === 'message_start')
-          onEvent({ type: 'status', text: '已收到模型响应，正在生成…' })
+          onEvent({ type: 'status', text: '正在写回复…' })
+        return
+      }
+
+      if (msg.type === 'user') {
+        handleUserToolResults(msg)
         return
       }
 
@@ -528,18 +725,8 @@ function runAgentTurnOnce(opts) {
         const content = msg.message?.content
         if (Array.isArray(content)) {
           for (const block of content) {
-            if (block?.type === 'tool_use') {
-              const id = block.id || `${block.name}-${seenTools.size}`
-              if (!seenTools.has(id)) {
-                seenTools.add(id)
-                onEvent({
-                  type: 'tool',
-                  id,
-                  name: block.name || 'Tool',
-                  preview: toolPreview(block.input),
-                })
-              }
-            }
+            if (block?.type === 'tool_use')
+              registerToolUse(block.id, block.name || 'Tool', block.input)
           }
           if (!assistantText) {
             const text = content
@@ -573,7 +760,7 @@ function runAgentTurnOnce(opts) {
           assistantText = msg.result
           onEvent({ type: 'delta', text: msg.result })
         }
-        onEvent({ type: 'status', text: '正在分析上下文构成…' })
+        onEvent({ type: 'status', text: '正在整理用量…' })
         void requestContextUsage().finally(() => {
           try {
             if (child.stdin?.writable) child.stdin.end()

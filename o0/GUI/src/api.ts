@@ -69,6 +69,27 @@ export type ChatImage = {
   dataUrl?: string
 }
 
+export type ActivityKind =
+  | 'thought'
+  | 'explored'
+  | 'edited'
+  | 'commands'
+  | 'worked'
+  | 'tool'
+
+export type ActivityItem = {
+  kind: ActivityKind | string
+  text: string
+  active?: boolean
+  ms?: number
+}
+
+export type FileChangeItem = {
+  filePath: string
+  added: number
+  removed: number
+}
+
 export type ChatMessage = {
   id: string
   role: ChatRole
@@ -77,11 +98,16 @@ export type ChatMessage = {
   model?: string
   /** Model thinking / chain-of-thought (when Thinking is on). */
   thinking?: string
+  /** TUI-parity turn activity (Worked / Searched / Wrote…). */
+  activity?: ActivityItem[]
+  filesChanged?: FileChangeItem[]
   usage?: MessageUsage | null
   usageDetail?: UsageDetail | null
   costFooter?: string | null
   images?: ChatImage[]
 }
+
+export type SessionStatus = 'active' | 'discarded'
 
 export type SessionSummary = {
   id: string
@@ -89,6 +115,8 @@ export type SessionSummary = {
   updatedAt: string
   createdAt: string
   messageCount: number
+  status?: SessionStatus
+  discardedAt?: string | null
 }
 
 export type Session = {
@@ -97,6 +125,8 @@ export type Session = {
   createdAt: string
   updatedAt: string
   messages: ChatMessage[]
+  status?: SessionStatus
+  discardedAt?: string | null
 }
 
 export type SettingsPublic = {
@@ -227,9 +257,12 @@ export async function unloadOllamaModel(model: string): Promise<{ ok: boolean; m
   )
 }
 
-export async function fetchSessions(): Promise<SessionSummary[]> {
+export async function fetchSessions(
+  status: SessionStatus | 'all' = 'all',
+): Promise<SessionSummary[]> {
+  const q = status === 'all' ? '' : `?status=${encodeURIComponent(status)}`
   const data = await parseJson<{ sessions: SessionSummary[] }>(
-    await fetch('/api/sessions'),
+    await fetch(`/api/sessions${q}`),
   )
   return data.sessions
 }
@@ -248,8 +281,48 @@ export async function fetchSession(id: string): Promise<Session> {
   return parseJson(await fetch(`/api/sessions/${id}`))
 }
 
+/// <summary> AI Cursor </summary>
+export async function renameSession(id: string, title: string): Promise<Session> {
+  return parseJson(
+    await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }),
+  )
+}
+
+/// <summary> AI Cursor — move session to discarded group (not permanent) </summary>
+export async function discardSession(id: string): Promise<Session> {
+  return parseJson(
+    await fetch(`/api/sessions/${encodeURIComponent(id)}/discard`, {
+      method: 'POST',
+    }),
+  )
+}
+
+/// <summary> AI Cursor </summary>
+export async function restoreSession(id: string): Promise<Session> {
+  return parseJson(
+    await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`, {
+      method: 'POST',
+    }),
+  )
+}
+
+/// <summary> AI Cursor — permanent delete </summary>
+export async function deleteSessionPermanent(id: string): Promise<void> {
+  await parseJson(
+    await fetch(
+      `/api/sessions/${encodeURIComponent(id)}?permanent=1`,
+      { method: 'DELETE' },
+    ),
+  )
+}
+
+/** @deprecated use discardSession — kept as soft discard alias */
 export async function deleteSession(id: string): Promise<void> {
-  await parseJson(await fetch(`/api/sessions/${id}`, { method: 'DELETE' }))
+  await discardSession(id)
 }
 
 /// <summary> AI Cursor </summary>
@@ -280,6 +353,8 @@ export type StreamHandlers = {
   onThinkingDone?: (id: string) => void
   onStatus?: (id: string, text: string) => void
   onTool?: (id: string, tool: { toolId: string; name: string; preview?: string }) => void
+  onActivity?: (id: string, item: ActivityItem) => void
+  onFilesChanged?: (id: string, files: FileChangeItem[]) => void
   onDone: (msg: ChatMessage, sessionMeta: { id: string; title: string; updatedAt: string }) => void
   onError: (message: string) => void
 }
@@ -374,6 +449,24 @@ export async function streamChat(
           name: String(data.name || 'Tool'),
           preview: data.preview ? String(data.preview) : '',
         })
+      else if (eventName === 'activity')
+        handlers.onActivity?.(String(data.id || ''), {
+          kind: String(data.kind || 'tool'),
+          text: String(data.text || ''),
+          active: Boolean(data.active),
+          ms: typeof data.ms === 'number' ? data.ms : undefined,
+        })
+      else if (eventName === 'files_changed')
+        handlers.onFilesChanged?.(
+          String(data.id || ''),
+          Array.isArray(data.files)
+            ? (data.files as FileChangeItem[]).map(f => ({
+                filePath: String(f.filePath || ''),
+                added: Number(f.added) || 0,
+                removed: Number(f.removed) || 0,
+              }))
+            : [],
+        )
       else if (eventName === 'done')
         handlers.onDone(
           data.message as ChatMessage,

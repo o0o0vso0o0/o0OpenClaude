@@ -9,17 +9,23 @@ import {
   type KeyboardEvent,
 } from 'react'
 import {
+  ActivityItem,
   ChatImage,
   ChatMessage,
+  FileChangeItem,
+  SessionStatus,
   SessionSummary,
   SettingsPublic,
   UsageDetail,
   createSession,
-  deleteSession,
+  discardSession,
+  deleteSessionPermanent,
   fetchSession,
   fetchSessions,
   fetchSettings,
   fetchUsageDetail,
+  renameSession,
+  restoreSession,
   saveSettings,
   startGuiLifetimeHeartbeat,
   streamChat,
@@ -30,6 +36,7 @@ import UsageDetailModal from './UsageDetailModal'
 import { localModelLabel } from './localModelLabel'
 import {
   classifyStreamPhase,
+  describeStreamWait,
   estimateRemainingSec,
   formatEtaSec,
   recordEtaSample,
@@ -39,6 +46,38 @@ import {
 const MAX_PENDING_IMAGES = 6
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
+const ACTIVITY_KIND_ORDER = [
+  'thought',
+  'explored',
+  'edited',
+  'commands',
+  'worked',
+  'tool',
+]
+
+/// <summary> AI Cursor </summary>
+function upsertActivity(
+  list: ActivityItem[] | undefined,
+  item: ActivityItem,
+): ActivityItem[] {
+  const next = [...(list || [])]
+  const i = next.findIndex(x => x.kind === item.kind)
+  if (i >= 0) next[i] = { ...next[i], ...item }
+  else next.push(item)
+  return next.sort((a, b) => {
+    const ai = ACTIVITY_KIND_ORDER.indexOf(String(a.kind))
+    const bi = ACTIVITY_KIND_ORDER.indexOf(String(b.kind))
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi)
+  })
+}
+
+/// <summary> AI Cursor </summary>
+function shortFilePath(filePath: string): string {
+  const p = String(filePath || '').replace(/\\/g, '/')
+  const parts = p.split('/').filter(Boolean)
+  if (parts.length <= 2) return p || filePath
+  return parts.slice(-2).join('/')
+}
 /// <summary> AI Cursor </summary>
 function isLikelyVisionModel(modelId: string): boolean {
   const id = String(modelId || '').toLowerCase()
@@ -115,6 +154,17 @@ function readFileAsChatImage(file: File): Promise<ChatImage | null> {
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  const [sessionBucket, setSessionBucket] = useState<SessionStatus>('active')
+  const [discardedCount, setDiscardedCount] = useState(0)
+  const [draggingSessionId, setDraggingSessionId] = useState<string | null>(null)
+  const [dropTargetBucket, setDropTargetBucket] = useState<SessionStatus | null>(
+    null,
+  )
+  const [sessionMenuId, setSessionMenuId] = useState<string | null>(null)
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const renameInputRef = useRef<HTMLInputElement | null>(null)
+  const sessionDragMovedRef = useRef(false)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [title, setTitle] = useState('新会话')
@@ -124,6 +174,8 @@ export default function App() {
     assistantId: string | null
     status: string
     steps: { kind: 'status' | 'tool'; text: string }[]
+    activity: ActivityItem[]
+    filesChanged: FileChangeItem[]
     startedAt: number
     phase: StreamPhase
     phaseStartedAt: number
@@ -158,9 +210,14 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  const refreshSessions = useCallback(async () => {
-    const list = await fetchSessions()
+  const refreshSessions = useCallback(async (bucket: SessionStatus) => {
+    const list = await fetchSessions(bucket)
     setSessions(list)
+    if (bucket === 'discarded') setDiscardedCount(list.length)
+    else {
+      const discarded = await fetchSessions('discarded')
+      setDiscardedCount(discarded.length)
+    }
     return list
   }, [])
 
@@ -170,28 +227,39 @@ export default function App() {
     setTitle(session.title)
     setMessages(session.messages)
     setError(null)
+    const st: SessionStatus =
+      session.status === 'discarded' ? 'discarded' : 'active'
+    setSessionBucket(st)
+    return session
   }, [])
 
   useEffect(() => {
+    let cancelled = false
     ;(async () => {
       try {
         const s = await fetchSettings()
+        if (cancelled) return
         setSettings(s)
         setFormBase(s.baseUrl)
         setFormModel(s.model)
         setFormCwd(s.cwd || '')
         setPlanMode(Boolean(s.planMode))
-        const list = await refreshSessions()
+        const list = await refreshSessions('active')
+        if (cancelled) return
         if (list.length > 0) await loadSession(list[0].id)
         else {
           const created = await createSession()
-          await refreshSessions()
+          if (cancelled) return
+          await refreshSessions('active')
           await loadSession(created.id)
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
       }
     })()
+    return () => {
+      cancelled = true
+    }
   }, [loadSession, refreshSessions])
 
   useEffect(() => {
@@ -251,23 +319,132 @@ export default function App() {
 
   useEffect(() => startGuiLifetimeHeartbeat(), [])
 
+  useEffect(() => {
+    if (!sessionMenuId) return
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t?.closest?.(`[data-session-menu="${CSS.escape(sessionMenuId)}"]`))
+        return
+      if (t?.closest?.(`[data-session-more="${CSS.escape(sessionMenuId)}"]`))
+        return
+      setSessionMenuId(null)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [sessionMenuId])
+
+  useEffect(() => {
+    if (!renamingId) return
+    renameInputRef.current?.focus()
+    renameInputRef.current?.select()
+  }, [renamingId])
+
+  /// <summary> AI Cursor </summary>
+  async function onSwitchBucket(next: SessionStatus) {
+    setSessionBucket(next)
+    const list = await refreshSessions(next)
+    if (list.some(s => s.id === activeId)) return
+    if (list[0]) await loadSession(list[0].id)
+    else if (next === 'active') {
+      const created = await createSession()
+      await refreshSessions('active')
+      await loadSession(created.id)
+    } else {
+      setActiveId(null)
+      setTitle('遗弃')
+      setMessages([])
+    }
+  }
+
   async function onNewSession() {
+    setSessionBucket('active')
     const created = await createSession()
-    await refreshSessions()
+    await refreshSessions('active')
     await loadSession(created.id)
   }
 
-  async function onDeleteSession(id: string) {
-    await deleteSession(id)
-    const list = await refreshSessions()
+  /// <summary> AI Cursor — move to discarded (not permanent) </summary>
+  async function onDiscardSession(id: string) {
+    await discardSession(id)
+    const list = await refreshSessions('active')
+    setSessionBucket('active')
     if (activeId === id) {
       if (list[0]) await loadSession(list[0].id)
       else {
         const created = await createSession()
-        await refreshSessions()
+        await refreshSessions('active')
         await loadSession(created.id)
       }
+    } else await refreshSessions('active')
+  }
+
+  /// <summary> AI Cursor </summary>
+  async function onRestoreSession(id: string) {
+    await restoreSession(id)
+    setSessionBucket('active')
+    await refreshSessions('active')
+    await loadSession(id)
+  }
+
+  /// <summary> AI Cursor </summary>
+  async function onPermanentDeleteSession(id: string) {
+    await deleteSessionPermanent(id)
+    const list = await refreshSessions('discarded')
+    if (activeId === id) {
+      if (list[0]) await loadSession(list[0].id)
+      else {
+        setSessionBucket('active')
+        const active = await refreshSessions('active')
+        if (active[0]) await loadSession(active[0].id)
+        else {
+          const created = await createSession()
+          await refreshSessions('active')
+          await loadSession(created.id)
+        }
+      }
     }
+  }
+
+  /// <summary> AI Cursor </summary>
+  function beginRenameSession(s: SessionSummary) {
+    setSessionMenuId(null)
+    setRenamingId(s.id)
+    setRenameDraft(s.title || '')
+  }
+
+  /// <summary> AI Cursor </summary>
+  async function commitRenameSession(id: string, raw: string, cancel = false) {
+    const prev = sessions.find(x => x.id === id)?.title || title
+    setRenamingId(null)
+    if (cancel) return
+    const next = raw.trim() || prev
+    if (next === prev) return
+    try {
+      const updated = await renameSession(id, next)
+      setSessions(list =>
+        list.map(s => (s.id === id ? { ...s, title: updated.title } : s)),
+      )
+      if (activeId === id) setTitle(updated.title)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /// <summary> AI Cursor </summary>
+  async function onDropSessionToBucket(
+    sessionId: string,
+    target: SessionStatus,
+  ) {
+    const id = String(sessionId || '').trim()
+    if (!id) return
+    const from = sessions.find(s => s.id === id)
+    const fromStatus: SessionStatus =
+      from?.status === 'discarded' || sessionBucket === 'discarded'
+        ? 'discarded'
+        : 'active'
+    if (fromStatus === target) return
+    if (target === 'discarded') await onDiscardSession(id)
+    else await onRestoreSession(id)
   }
 
   async function openSettings() {
@@ -372,6 +549,10 @@ export default function App() {
 
   async function onSend() {
     if (!activeId || busy) return
+    if (sessionBucket === 'discarded') {
+      setError('当前会话在遗弃分组中。请先点「恢复」再继续对话。')
+      return
+    }
     if (!input.trim() && pendingImages.length === 0) return
     if (settings && !settings.apiKeySet && !formKey) {
       setSettingsOpen(true)
@@ -401,7 +582,9 @@ export default function App() {
     setStreamProgress({
       assistantId: null,
       status: '正在发送…',
-      steps: [{ kind: 'status', text: '正在发送…' }],
+      steps: [],
+      activity: [],
+      filesChanged: [],
       startedAt: turnStartedAt,
       phase: 'sending',
       phaseStartedAt: turnStartedAt,
@@ -426,6 +609,8 @@ export default function App() {
           assistantId: null,
           status: '',
           steps: [] as { kind: 'status' | 'tool'; text: string }[],
+          activity: [] as ActivityItem[],
+          filesChanged: [] as FileChangeItem[],
           startedAt: now,
           phase: 'unknown' as StreamPhase,
           phaseStartedAt: now,
@@ -434,13 +619,20 @@ export default function App() {
           toolCount: 0,
           etaSec: null,
         }
-        const steps = [...base.steps]
-        const last = steps[steps.length - 1]
         let toolCount = base.toolCount
-        if (!(last && last.kind === kind && last.text === progressText)) {
-          steps.push({ kind, text: progressText })
-          if (kind === 'tool') toolCount += 1
-        }
+        // Only keep tool steps as rare fallback; status is phase-mapped in UI.
+        const steps =
+          kind === 'tool'
+            ? (() => {
+                const next = [...base.steps]
+                const last = next[next.length - 1]
+                if (!(last && last.kind === kind && last.text === progressText)) {
+                  next.push({ kind, text: progressText })
+                  toolCount += 1
+                }
+                return next.slice(-12)
+              })()
+            : base.steps
         const status = kind === 'status' ? progressText : base.status || progressText
         const phase = classifyStreamPhase(status, {
           hasContent: base.contentChars > 0,
@@ -451,7 +643,7 @@ export default function App() {
           ...base,
           assistantId: assistantMsgId || base.assistantId,
           status,
-          steps: steps.slice(-24),
+          steps,
           phase,
           phaseStartedAt: phaseChanged ? now : base.phaseStartedAt,
           toolCount,
@@ -469,13 +661,15 @@ export default function App() {
             liveAssistantId = id
             setStreamProgress(prev =>
               prev
-                ? { ...prev, assistantId: id, status: prev.status || '等待模型…' }
+                ? { ...prev, assistantId: id, status: prev.status || '正在启动…' }
                 : {
                     assistantId: id,
-                    status: '等待模型…',
-                    steps: [{ kind: 'status', text: '等待模型…' }],
+                    status: '正在启动…',
+                    steps: [],
+                    activity: [],
+                    filesChanged: [],
                     startedAt: Date.now(),
-                    phase: 'wait_first' as StreamPhase,
+                    phase: 'boot' as StreamPhase,
                     phaseStartedAt: Date.now(),
                     firstTokenAt: null,
                     contentChars: 0,
@@ -512,7 +706,7 @@ export default function App() {
                 status:
                   prev.phase === 'generating' || prev.phase === 'tool'
                     ? prev.status
-                    : '正在生成…',
+                    : '正在写回复…',
               }
             })
             setMessages(prev =>
@@ -526,6 +720,17 @@ export default function App() {
             setThinkingOpen(prev =>
               prev[id] ? prev : { ...prev, [id]: true },
             )
+            setStreamProgress(prev => {
+              if (!prev) return prev
+              const phase = 'thinking' as StreamPhase
+              return {
+                ...prev,
+                status: '正在思考…',
+                phase,
+                phaseStartedAt:
+                  phase !== prev.phase ? Date.now() : prev.phaseStartedAt,
+              }
+            })
             setMessages(prev =>
               prev.map(m =>
                 m.id === id
@@ -551,6 +756,44 @@ export default function App() {
             const label = `调用工具 ${tool.name}${tool.preview ? ` · ${tool.preview}` : ''}`
             pushProgress('tool', label, id || undefined)
           },
+          onActivity: (id, item) => {
+            if (!item?.text) return
+            setStreamProgress(prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    activity: upsertActivity(prev.activity, item),
+                  }
+                : prev,
+            )
+            if (!id) return
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === id
+                  ? { ...m, activity: upsertActivity(m.activity, item) }
+                  : m,
+              ),
+            )
+          },
+          onFilesChanged: (id, files) => {
+            const list = Array.isArray(files) ? files.filter(f => f.filePath) : []
+            setStreamProgress(prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    filesChanged: list,
+                  }
+                : prev,
+            )
+            if (!id) return
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === id ? { ...m, filesChanged: list } : m,
+              ),
+            )
+          },
           onDone: (msg, meta) => {
             const turnSec = Math.max(0.5, (Date.now() - turnStartedAt) / 1000)
             const ttftSec =
@@ -566,7 +809,7 @@ export default function App() {
             setThinkingOpen(prev => ({ ...prev, [msg.id]: false }))
             setMessages(prev => prev.map(m => (m.id === msg.id ? msg : m)))
             setTitle(meta.title)
-            void refreshSessions()
+            void refreshSessions(sessionBucket)
           },
           onError: message => setError(message),
         },
@@ -678,21 +921,230 @@ export default function App() {
             </button>
           </div>
         </div>
+        <div className="session-bucket-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sessionBucket === 'active'}
+            className={`session-bucket-tab${sessionBucket === 'active' ? ' active' : ''}${dropTargetBucket === 'active' ? ' drop-hover' : ''}`}
+            onClick={() => void onSwitchBucket('active')}
+            onDragOver={e => {
+              if (!draggingSessionId) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+              setDropTargetBucket('active')
+            }}
+            onDragLeave={() => {
+              setDropTargetBucket(prev => (prev === 'active' ? null : prev))
+            }}
+            onDrop={e => {
+              e.preventDefault()
+              const id =
+                e.dataTransfer.getData('application/x-o0-session-id') ||
+                draggingSessionId ||
+                ''
+              setDropTargetBucket(null)
+              setDraggingSessionId(null)
+              void onDropSessionToBucket(id, 'active')
+            }}
+          >
+            进行中
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={sessionBucket === 'discarded'}
+            className={`session-bucket-tab${sessionBucket === 'discarded' ? ' active' : ''}${dropTargetBucket === 'discarded' ? ' drop-hover' : ''}`}
+            onClick={() => void onSwitchBucket('discarded')}
+            onDragOver={e => {
+              if (!draggingSessionId) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+              setDropTargetBucket('discarded')
+            }}
+            onDragLeave={() => {
+              setDropTargetBucket(prev => (prev === 'discarded' ? null : prev))
+            }}
+            onDrop={e => {
+              e.preventDefault()
+              const id =
+                e.dataTransfer.getData('application/x-o0-session-id') ||
+                draggingSessionId ||
+                ''
+              setDropTargetBucket(null)
+              setDraggingSessionId(null)
+              void onDropSessionToBucket(id, 'discarded')
+            }}
+          >
+            遗弃
+            {discardedCount > 0 ? (
+              <span className="session-bucket-count">{discardedCount}</span>
+            ) : null}
+          </button>
+        </div>
+        {draggingSessionId ? (
+          <div className="session-drag-hint">
+            拖到「{sessionBucket === 'active' ? '遗弃' : '进行中'}」分组
+          </div>
+        ) : null}
         <div className="session-list">
+          {sessions.length === 0 && (
+            <div className="session-empty">
+              {sessionBucket === 'discarded'
+                ? '遗弃分组为空 · 从进行中拖入'
+                : '暂无会话'}
+            </div>
+          )}
           {sessions.map(s => (
-            <button
+            <div
               key={s.id}
-              type="button"
-              className={`session-item${s.id === activeId ? ' active' : ''}`}
-              onClick={() => void loadSession(s.id)}
-              onContextMenu={e => {
-                e.preventDefault()
-                if (confirm(`删除会话「${s.title}」？`)) void onDeleteSession(s.id)
+              role="button"
+              tabIndex={0}
+              draggable={renamingId !== s.id}
+              data-session-row={s.id}
+              className={`session-item${s.id === activeId ? ' active' : ''}${sessionBucket === 'discarded' ? ' discarded' : ''}${draggingSessionId === s.id ? ' dragging' : ''}${sessionMenuId === s.id ? ' menu-open' : ''}`}
+              onClick={() => {
+                if (renamingId === s.id) return
+                if (sessionDragMovedRef.current) {
+                  sessionDragMovedRef.current = false
+                  return
+                }
+                setSessionMenuId(null)
+                void loadSession(s.id)
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  void loadSession(s.id)
+                }
+              }}
+              onDragStart={e => {
+                if (renamingId === s.id) {
+                  e.preventDefault()
+                  return
+                }
+                sessionDragMovedRef.current = false
+                setSessionMenuId(null)
+                setDraggingSessionId(s.id)
+                e.dataTransfer.setData('application/x-o0-session-id', s.id)
+                e.dataTransfer.setData('text/plain', s.id)
+                e.dataTransfer.effectAllowed = 'move'
+              }}
+              onDrag={e => {
+                if (e.clientX !== 0 || e.clientY !== 0)
+                  sessionDragMovedRef.current = true
+              }}
+              onDragEnd={() => {
+                setDraggingSessionId(null)
+                setDropTargetBucket(null)
               }}
             >
-              <div className="session-title">{s.title}</div>
-              <div className="session-meta">{formatTime(s.updatedAt)}</div>
-            </button>
+              {renamingId === s.id ? (
+                <input
+                  ref={renameInputRef}
+                  className="session-rename-input"
+                  value={renameDraft}
+                  aria-label="重命名会话"
+                  onClick={e => e.stopPropagation()}
+                  onChange={e => setRenameDraft(e.target.value)}
+                  onKeyDown={e => {
+                    e.stopPropagation()
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      void commitRenameSession(s.id, renameDraft)
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault()
+                      void commitRenameSession(s.id, renameDraft, true)
+                    }
+                  }}
+                  onBlur={() => void commitRenameSession(s.id, renameDraft)}
+                />
+              ) : (
+                <>
+                  <div className="session-title">{s.title}</div>
+                  <div className="session-meta">
+                    {sessionBucket === 'discarded'
+                      ? `遗弃于 ${formatTime(s.discardedAt || s.updatedAt)}`
+                      : formatTime(s.updatedAt)}
+                  </div>
+                </>
+              )}
+              <button
+                type="button"
+                className="session-more"
+                data-session-more={s.id}
+                title="更多"
+                aria-label="更多"
+                aria-expanded={sessionMenuId === s.id}
+                draggable={false}
+                onMouseDown={e => e.stopPropagation()}
+                onClick={e => {
+                  e.stopPropagation()
+                  e.preventDefault()
+                  setSessionMenuId(prev => (prev === s.id ? null : s.id))
+                }}
+              >
+                ⋯
+              </button>
+              {sessionMenuId === s.id && (
+                <div
+                  className="session-menu"
+                  data-session-menu={s.id}
+                  role="menu"
+                  onClick={e => e.stopPropagation()}
+                  onMouseDown={e => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => beginRenameSession(s)}
+                  >
+                    重命名
+                  </button>
+                  {sessionBucket === 'active' ? (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setSessionMenuId(null)
+                        void onDiscardSession(s.id)
+                      }}
+                    >
+                      移入遗弃
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setSessionMenuId(null)
+                          void onRestoreSession(s.id)
+                        }}
+                      >
+                        恢复
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="danger"
+                        onClick={() => {
+                          setSessionMenuId(null)
+                          if (
+                            confirm(
+                              `永久删除「${s.title}」？此操作不可恢复。`,
+                            )
+                          )
+                            void onPermanentDeleteSession(s.id)
+                        }}
+                      >
+                        永久删除
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
           ))}
         </div>
       </aside>
@@ -701,6 +1153,31 @@ export default function App() {
         <div className="topbar">
           <h1>{title}</h1>
           <div className="sidebar-actions">
+            {sessionBucket === 'discarded' && activeId && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void onRestoreSession(activeId)}
+                >
+                  恢复
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    if (
+                      confirm(
+                        `永久删除「${title}」？此操作不可恢复。`,
+                      )
+                    )
+                      void onPermanentDeleteSession(activeId)
+                  }}
+                >
+                  永久删除
+                </button>
+              </>
+            )}
             <button type="button" className="btn btn-ghost" onClick={() => setModelPickerOpen(true)}>
               {settings?.apiKeySet || settings?.provider === 'ollama'
                 ? settings?.provider === 'ollama'
@@ -778,36 +1255,123 @@ export default function App() {
                 <div className="msg-body">
                   {body ||
                     (busy && streamProgress?.assistantId === m.id ? (
-                      <span className="stream-waiting">等待模型输出…</span>
+                      <span className="stream-waiting">正在写回复…</span>
                     ) : (
                       ''
                     ))}
                 </div>
-                {busy && streamProgress?.assistantId === m.id && (
-                  <div className="stream-progress" aria-live="polite">
-                    <div className="stream-progress-meta">
-                      <span className="stream-progress-status">
-                        {streamProgress.status || '处理中…'}
-                      </span>
-                      <span className="stream-timing">
-                        <span>已等待 {elapsedSec}s</span>
-                        <span className="stream-eta">
-                          预计剩余 {formatEtaSec(streamProgress.etaSec)}
-                        </span>
-                      </span>
+                {(() => {
+                  const live =
+                    busy && streamProgress?.assistantId === m.id
+                      ? streamProgress
+                      : null
+                  const activity =
+                    (live?.activity?.length
+                      ? live.activity
+                      : m.activity) || []
+                  const files =
+                    (live?.filesChanged?.length
+                      ? live.filesChanged
+                      : m.filesChanged) || []
+                  if (!activity.length && !files.length && !live) return null
+                  const liveIsLocal =
+                    settings?.provider === 'ollama' ||
+                    /11434|ollama/i.test(String(settings?.baseUrl || ''))
+                  const wait = live
+                    ? describeStreamWait({
+                        phase: live.phase,
+                        isLocal: liveIsLocal,
+                      })
+                    : null
+                  const showWaitCard =
+                    Boolean(live) && activity.length === 0 && !files.length
+                  return (
+                    <div className="msg-turn-meta">
+                      {showWaitCard && wait && (
+                        <div className="stream-wait" aria-live="polite">
+                          <div className="stream-wait-title">
+                            <span className="stream-wait-dot" aria-hidden />
+                            <span>{wait.title}</span>
+                          </div>
+                          <div className="stream-wait-sub">
+                            {wait.tip ? (
+                              <span className="stream-wait-tip">{wait.tip}</span>
+                            ) : null}
+                            <span>已等 {elapsedSec}s</span>
+                            <span className="stream-eta">
+                              {formatEtaSec(live!.etaSec)}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                      {live && !showWaitCard && (
+                        <div className="stream-wait-sub stream-wait-sub-inline">
+                          <span>已等 {elapsedSec}s</span>
+                          <span className="stream-eta">
+                            {formatEtaSec(live.etaSec)}
+                          </span>
+                        </div>
+                      )}
+                      {activity.length > 0 && (
+                        <ul className="msg-activity">
+                          {activity.map(item => (
+                            <li
+                              key={item.kind}
+                              className={`msg-activity-item kind-${item.kind}${item.active ? ' active' : ''}`}
+                            >
+                              <span className="msg-activity-mark" aria-hidden>
+                                {item.kind === 'thought'
+                                  ? '◇'
+                                  : item.kind === 'worked'
+                                    ? '✓'
+                                    : '·'}
+                              </span>
+                              <span>{item.text}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {files.length > 0 && (
+                        <details className="msg-files-changed">
+                          <summary>
+                            Files Changed
+                            <span className="msg-files-count">
+                              {files.length}
+                            </span>
+                            <span className="msg-files-stat">
+                              <span className="add">
+                                +
+                                {files.reduce((s, f) => s + (f.added || 0), 0)}
+                              </span>
+                              <span className="del">
+                                -
+                                {files.reduce(
+                                  (s, f) => s + (f.removed || 0),
+                                  0,
+                                )}
+                              </span>
+                            </span>
+                          </summary>
+                          <ul className="msg-files-list">
+                            {files.map(f => (
+                              <li key={f.filePath} title={f.filePath}>
+                                <span className="msg-file-path">
+                                  {shortFilePath(f.filePath)}
+                                </span>
+                                <span className="msg-files-stat">
+                                  <span className="add">+{f.added || 0}</span>
+                                  <span className="del">
+                                    -{f.removed || 0}
+                                  </span>
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      )}
                     </div>
-                    {streamProgress.steps.length > 0 && (
-                      <ul className="stream-steps">
-                        {streamProgress.steps.slice(-8).map((step, i) => (
-                          <li key={`${step.kind}-${i}-${step.text}`} className={`stream-step ${step.kind}`}>
-                            {step.kind === 'tool' ? '⚙ ' : '· '}
-                            {step.text}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
+                  )
+                })()}
                 {cost && (
                   <button
                     type="button"
@@ -842,6 +1406,11 @@ export default function App() {
           onDrop={onDrop}
         >
           {error && <div className="error-banner">{error}</div>}
+          {sessionBucket === 'discarded' && (
+            <div className="warn-banner">
+              此会话在遗弃分组中（只读）。可点顶栏「恢复」继续对话，或「永久删除」。
+            </div>
+          )}
           {pendingImages.length > 0 &&
             !isLikelyVisionModel(settings?.model || formModel) && (
               <div className="warn-banner">
@@ -876,7 +1445,7 @@ export default function App() {
               onKeyDown={onKeyDown}
               onPaste={onPaste}
               placeholder="输入消息，可拖拽/粘贴图片；Enter 发送，Shift+Enter 换行"
-              disabled={busy || !activeId}
+              disabled={busy || !activeId || sessionBucket === 'discarded'}
             />
             <div className="composer-actions">
               <button
@@ -910,7 +1479,11 @@ export default function App() {
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={busy || (!input.trim() && pendingImages.length === 0)}
+                disabled={
+                  busy ||
+                  sessionBucket === 'discarded' ||
+                  (!input.trim() && pendingImages.length === 0)
+                }
                 onClick={() => void onSend()}
               >
                 {busy ? '生成中' : '发送'}
