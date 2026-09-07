@@ -1405,12 +1405,9 @@ export async function analyzeContextUsage(
     model: runtimeModel,
     memoryFiles: memoryFileDetails,
     mcpTools: mcpToolDetails,
-    deferredBuiltinTools:
-      process.env.USER_TYPE === 'ant' ? deferredBuiltinDetails : undefined,
-    systemTools:
-      process.env.USER_TYPE === 'ant' ? systemToolDetails : undefined,
-    systemPromptSections:
-      process.env.USER_TYPE === 'ant' ? systemPromptSections : undefined,
+    deferredBuiltinTools: deferredBuiltinDetails,
+    systemTools: systemToolDetails,
+    systemPromptSections,
     agents: agentDetails,
     slashCommands:
       slashCommandTokens > 0

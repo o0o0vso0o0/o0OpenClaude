@@ -6,6 +6,67 @@ export type MessageUsage = {
   completionTokens: number
   totalTokens?: number
   costCa: number | null
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+  numTurns?: number | null
+}
+
+export type UsageCategoryRow = {
+  id: string
+  label: string
+  tokens: number
+  count: number
+  share: number
+  mappedTokens?: number
+  note?: string
+  children?: UsageCategoryRow[]
+}
+
+export type ContextBreakdown = {
+  totalTokens: number
+  categories: UsageCategoryRow[]
+  systemPromptSections: UsageCategoryRow[]
+  systemTools: UsageCategoryRow[]
+  memoryFiles: UsageCategoryRow[]
+  mcpTools: UsageCategoryRow[]
+}
+
+export type UsageDetail = {
+  model?: string | null
+  billed: {
+    inputTokens: number
+    outputTokens: number
+    cacheReadInputTokens: number
+    cacheCreationInputTokens: number
+    numTurns: number | null
+    avgInputPerTurn: number | null
+  }
+  models: Array<{
+    model: string
+    inputTokens: number
+    outputTokens: number
+    cacheReadInputTokens: number
+    cacheCreationInputTokens: number
+    costUSD: number | null
+  }>
+  composition: {
+    ok: boolean
+    estimatedTotal: number
+    categories: UsageCategoryRow[]
+    messages: number
+  } | null
+  contextBreakdown?: ContextBreakdown | null
+  mappedToBilledInput: UsageCategoryRow[] | null
+  notes: string[]
+}
+
+export type ChatImage = {
+  id: string
+  name?: string
+  mediaType: string
+  /** raw base64 without data: prefix (send) or dataUrl (stored display) */
+  data?: string
+  dataUrl?: string
 }
 
 export type ChatMessage = {
@@ -15,7 +76,9 @@ export type ChatMessage = {
   createdAt: string
   model?: string
   usage?: MessageUsage | null
+  usageDetail?: UsageDetail | null
   costFooter?: string | null
+  images?: ChatImage[]
 }
 
 export type SessionSummary = {
@@ -40,6 +103,10 @@ export type SettingsPublic = {
   apiKey: string
   apiKeySet: boolean
   apiKeyPreview?: string
+  cwd?: string
+  planMode?: boolean
+  agentCli?: string | null
+  agentReady?: boolean
 }
 
 export type ModelPrice = {
@@ -95,6 +162,8 @@ export async function saveSettings(body: {
   apiKey?: string
   baseUrl?: string
   model?: string
+  cwd?: string
+  planMode?: boolean
   clearApiKey?: boolean
 }): Promise<SettingsPublic> {
   return parseJson(
@@ -160,16 +229,43 @@ export type StreamHandlers = {
 }
 
 /// <summary> AI Cursor </summary>
+export async function fetchUsageDetail(
+  sessionId: string,
+  messageId: string,
+): Promise<UsageDetail> {
+  const res = await fetch(
+    `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/usage-detail`,
+  )
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok)
+    throw new Error((data as { error?: string }).error || res.statusText)
+  return (data as { usageDetail: UsageDetail }).usageDetail
+}
+
 export async function streamChat(
   sessionId: string,
   content: string,
   handlers: StreamHandlers,
   signal?: AbortSignal,
+  images?: ChatImage[],
 ): Promise<void> {
+  const payloadImages = (images || [])
+    .map(img => ({
+      id: img.id,
+      name: img.name,
+      mediaType: img.mediaType,
+      data: img.data || (img.dataUrl || '').replace(/^data:[^;]+;base64,/, ''),
+    }))
+    .filter(img => img.data)
+
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId, content }),
+    body: JSON.stringify({
+      sessionId,
+      content,
+      images: payloadImages.length ? payloadImages : undefined,
+    }),
     signal,
   })
 

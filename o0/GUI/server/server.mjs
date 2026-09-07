@@ -1,6 +1,6 @@
 /**
  * AI Cursor — OpenClaude GUI local server (no TUI).
- * Serves API + static UI. Proxies OpenAI-compatible chat (e.g. chatanywhere.tech).
+ * Agent harness via CLI stream-json; OpenAI-compatible provider (e.g. chatanywhere).
  */
 import cors from 'cors'
 import express from 'express'
@@ -14,9 +14,10 @@ import {
   getModelsCatalog,
   lookupModelPrice,
   calcTokenCostCa,
-  stripCostFooter,
   buildCostFooter,
 } from './models-catalog.mjs'
+import { resolveOpenClaudeCli, runAgentTurn, findSessionJsonl } from './agent-harness.mjs'
+import { analyzeSessionJsonl, buildUsageDetail } from './usage-analysis.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GUI_ROOT = path.resolve(__dirname, '..')
@@ -85,6 +86,10 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   baseUrl: 'https://api.chatanywhere.tech/v1',
   model: 'gpt-4o-mini',
+  /** Agent 工作目录（仓库根） */
+  cwd: '',
+  /** Plan mode：只读规划，限制写文件 */
+  planMode: false,
   /** @type {Record<string, string>} modelId -> ISO last-used time */
   modelLastUsed: {},
 }
@@ -232,9 +237,50 @@ function normalizeBaseUrl(baseUrl) {
   return u
 }
 
+const ALLOWED_IMAGE_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/gif',
+  'image/webp',
+])
+const MAX_CHAT_IMAGES = 6
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+/// <summary> AI Cursor </summary>
+function normalizeChatImages(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    let mediaType = String(item.mediaType || item.media_type || '').toLowerCase()
+    let data = String(item.data || '')
+    if (data.startsWith('data:')) {
+      const m = data.match(/^data:([^;]+);base64,(.+)$/s)
+      if (!m) continue
+      mediaType = mediaType || m[1].toLowerCase()
+      data = m[2]
+    }
+    if (mediaType === 'image/jpg') mediaType = 'image/jpeg'
+    if (!ALLOWED_IMAGE_TYPES.has(mediaType)) continue
+    data = data.replace(/\s+/g, '')
+    if (!data) continue
+    const approxBytes = Math.floor((data.length * 3) / 4)
+    if (approxBytes > MAX_IMAGE_BYTES) continue
+    out.push({
+      id: String(item.id || randomUUID()),
+      name: String(item.name || 'image').slice(0, 120),
+      mediaType,
+      data,
+    })
+    if (out.length >= MAX_CHAT_IMAGES) break
+  }
+  return out
+}
+
 const app = express()
 app.use(cors({ origin: true }))
-app.use(express.json({ limit: '4mb' }))
+app.use(express.json({ limit: '25mb' }))
 app.use((req, _res, next) => {
   if (req.path.startsWith('/api/')) touchHeartbeat()
   next()
@@ -291,14 +337,19 @@ app.get('/api/models', async (req, res) => {
 app.get('/api/settings', (_req, res) => {
   const s = readSettings()
   const key = s.apiKey ? String(s.apiKey) : ''
+  const cli = resolveOpenClaudeCli(GUI_ROOT)
   res.json({
     baseUrl: s.baseUrl,
     model: s.model,
+    cwd: s.cwd || '',
+    planMode: Boolean(s.planMode),
     apiKey: key,
     apiKeySet: Boolean(key.trim()),
     apiKeyPreview: key
       ? `${key.slice(0, 4)}…${key.slice(-4)}`
       : '',
+    agentCli: cli?.label || null,
+    agentReady: Boolean(cli),
   })
 })
 
@@ -308,6 +359,9 @@ app.put('/api/settings', (req, res) => {
   const next = {
     baseUrl: body.baseUrl != null ? String(body.baseUrl).trim() : cur.baseUrl,
     model: body.model != null ? String(body.model).trim() : cur.model,
+    cwd: body.cwd != null ? String(body.cwd).trim() : cur.cwd || '',
+    planMode:
+      body.planMode != null ? Boolean(body.planMode) : Boolean(cur.planMode),
     apiKey: cur.apiKey,
     modelLastUsed: { ...(cur.modelLastUsed || {}) },
   }
@@ -316,17 +370,21 @@ app.put('/api/settings', (req, res) => {
     if (key && key !== '********') next.apiKey = key
   }
   if (body.clearApiKey === true) next.apiKey = ''
-  // modelLastUsed only updates on real chat send (/api/chat), not on picker select
   const saved = writeSettings(next)
   const key = saved.apiKey ? String(saved.apiKey) : ''
+  const cli = resolveOpenClaudeCli(GUI_ROOT)
   res.json({
     baseUrl: saved.baseUrl,
     model: saved.model,
+    cwd: saved.cwd || '',
+    planMode: Boolean(saved.planMode),
     apiKey: key,
     apiKeySet: Boolean(key.trim()),
     apiKeyPreview: key
       ? `${key.slice(0, 4)}…${key.slice(-4)}`
       : '',
+    agentCli: cli?.label || null,
+    agentReady: Boolean(cli),
   })
 })
 
@@ -372,10 +430,47 @@ app.delete('/api/sessions/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+/// <summary> AI Cursor </summary>
+app.get('/api/sessions/:id/messages/:messageId/usage-detail', (req, res) => {
+  const session = readSession(req.params.id)
+  if (!session) return res.status(404).json({ error: 'session not found' })
+  const msg = (session.messages || []).find(m => m.id === req.params.messageId)
+  if (!msg) return res.status(404).json({ error: 'message not found' })
+  if (msg.usageDetail) return res.json({ usageDetail: msg.usageDetail, cached: true })
+
+  const configDir = path.join(DATA_DIR, 'openclaude-config')
+  const jsonlPath = session.agentSessionId
+    ? findSessionJsonl(configDir, session.agentSessionId)
+    : null
+  const composition = analyzeSessionJsonl(jsonlPath)
+  const usage = msg.usage || {}
+  const usageDetail = buildUsageDetail({
+    usage: {
+      input_tokens: usage.promptTokens || 0,
+      output_tokens: usage.completionTokens || 0,
+      cache_read_input_tokens: usage.cacheReadInputTokens || 0,
+      cache_creation_input_tokens: usage.cacheCreationInputTokens || 0,
+    },
+    numTurns: usage.numTurns || null,
+    composition,
+    model: msg.model || null,
+  })
+
+  // Persist so later clicks are free.
+  msg.usageDetail = usageDetail
+  writeSession(session)
+  res.json({ usageDetail, cached: false })
+})
+
 app.post('/api/chat', async (req, res) => {
-  const { sessionId, content } = req.body || {}
-  if (!sessionId || typeof content !== 'string' || !content.trim())
+  const { sessionId, content, images: rawImages } = req.body || {}
+  if (!sessionId || typeof content !== 'string')
     return res.status(400).json({ error: 'sessionId and content required' })
+
+  const images = normalizeChatImages(rawImages)
+  const text = content.trim()
+  if (!text && images.length === 0)
+    return res.status(400).json({ error: 'content or images required' })
 
   const session = readSession(sessionId)
   if (!session) return res.status(404).json({ error: 'session not found' })
@@ -387,34 +482,34 @@ app.post('/api/chat', async (req, res) => {
   const modelId = settings.model || DEFAULT_SETTINGS.model
   touchModelLastUsed(modelId, settings)
 
+  const displayText =
+    text || (images.length ? `（${images.length} 张图片）` : '')
   const userMsg = {
     id: randomUUID(),
     role: 'user',
-    content: content.trim(),
+    content: displayText,
     createdAt: new Date().toISOString(),
+    images: images.map((img, i) => ({
+      id: img.id || `img-${i}`,
+      name: img.name || `image-${i + 1}`,
+      mediaType: img.mediaType,
+      dataUrl: `data:${img.mediaType};base64,${img.data}`,
+    })),
   }
   session.messages.push(userMsg)
   if (session.messages.filter(m => m.role === 'user').length === 1)
-    session.title = content.trim().slice(0, 40) || session.title
+    session.title = (text || '图片提问').slice(0, 40) || session.title
   try {
     writeSession(session)
   } catch (e) {
     return res.status(500).json({ error: `保存会话失败: ${e?.message || e}` })
   }
 
-  const apiMessages = session.messages.map(m => ({
-    role: m.role,
-    content: stripCostFooter(m.content),
-  }))
-
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders?.()
 
-  // IMPORTANT: use res 'close', not req 'close'.
-  // Express has already consumed the POST body; req 'close' often fires immediately
-  // and would abort the upstream stream loop → empty assistant replies.
   let closed = false
   res.on('close', () => {
     closed = true
@@ -433,140 +528,141 @@ app.post('/api/chat', async (req, res) => {
     }
   }
 
-  send('user', userMsg)
+  /// <summary> AI Cursor </summary>
+  async function finalizeAssistant(
+    assistantId,
+    assistantText,
+    usageLike,
+    usageDetail = null,
+  ) {
+    const promptTokens = Number(usageLike?.promptTokens ?? usageLike?.prompt_tokens) || 0
+    const completionTokens =
+      Number(usageLike?.completionTokens ?? usageLike?.completion_tokens) || 0
+    const hasCounts = promptTokens > 0 || completionTokens > 0
+    const price = await lookupModelPrice(modelId, {
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      dataDir: DATA_DIR,
+    })
+    const { costCa } = calcTokenCostCa(price, promptTokens, completionTokens)
+    const priceKnown = costCa != null && hasCounts
 
+    const body = assistantText || '(空回复)'
+    const footer = hasCounts
+      ? buildCostFooter({
+          promptTokens,
+          completionTokens,
+          costCa,
+          priceKnown,
+        })
+      : '费用：本轮用量未返回，无法计价'
+
+    const content = `${body}\n\n---\n${footer}`
+    send('delta', { id: assistantId, text: `\n\n---\n${footer}` })
+
+    const assistantMsg = {
+      id: assistantId,
+      role: 'assistant',
+      content,
+      createdAt: new Date().toISOString(),
+      model: modelId,
+      usage: hasCounts
+        ? {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            costCa: priceKnown ? costCa : null,
+            cacheReadInputTokens:
+              Number(usageLike?.cacheReadInputTokens) || 0,
+            cacheCreationInputTokens:
+              Number(usageLike?.cacheCreationInputTokens) || 0,
+            numTurns: usageLike?.numTurns ?? null,
+          }
+        : null,
+      usageDetail: usageDetail || null,
+      costFooter: footer,
+    }
+    session.messages.push(assistantMsg)
+    session.updatedAt = new Date().toISOString()
+    writeSession(session)
+    send('done', {
+      message: assistantMsg,
+      session: {
+        id: session.id,
+        title: session.title,
+        updatedAt: session.updatedAt,
+        agentSessionId: session.agentSessionId || null,
+      },
+    })
+  }
+
+  send('user', userMsg)
   const assistantId = randomUUID()
-  let assistantText = ''
-  /** @type {{ prompt_tokens?: number, completion_tokens?: number, total_tokens?: number } | null} */
-  let usage = null
   send('assistant_start', { id: assistantId })
 
   const baseUrl = normalizeBaseUrl(settings.baseUrl)
-  const url = `${baseUrl}/chat/completions`
 
   try {
-    const upstream = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${settings.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: modelId,
-        messages: apiMessages,
-        stream: true,
-        stream_options: { include_usage: true },
-      }),
+    const workCwd =
+      String(settings.cwd || '').trim() ||
+      process.env.OPENCLAUDE_GUI_CWD ||
+      path.resolve(GUI_ROOT, '..', '..')
+    const configDir = path.join(DATA_DIR, 'openclaude-config')
+    fs.mkdirSync(configDir, { recursive: true })
+
+    let assistantText = ''
+    const ac = new AbortController()
+    res.on('close', () => {
+      try {
+        ac.abort()
+      } catch {
+        /* ignore */
+      }
     })
 
-    if (!upstream.ok) {
-      const errText = await upstream.text()
-      send('error', {
-        error: `上游 API ${upstream.status}: ${errText.slice(0, 500)}`,
-      })
-      if (!res.writableEnded) res.end()
-      return
-    }
-
-    const reader = upstream.body?.getReader()
-    if (!reader) {
-      send('error', { error: '上游无流式响应体' })
-      if (!res.writableEnded) res.end()
-      return
-    }
-
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      if (closed) {
-        try {
-          await reader.cancel()
-        } catch {
-          /* ignore */
-        }
-        break
-      }
-      const { done, value } = await reader.read()
-      if (done) break
-      touchHeartbeat()
-      buffer += decoder.decode(value, { stream: true })
-      const parts = buffer.split('\n')
-      buffer = parts.pop() || ''
-      for (const line of parts) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('data:')) continue
-        const payload = trimmed.slice(5).trim()
-        if (payload === '[DONE]') continue
-        try {
-          const json = JSON.parse(payload)
-          if (json.usage && typeof json.usage === 'object') usage = json.usage
-          const delta =
-            json.choices?.[0]?.delta?.content ??
-            json.choices?.[0]?.delta?.reasoning_content
-          if (delta) {
-            assistantText += delta
-            if (!send('delta', { id: assistantId, text: delta })) break
-          }
-        } catch {
-          // ignore partial JSON
-        }
-      }
-    }
-
-    if (!closed) {
-      const promptTokens = Number(usage?.prompt_tokens) || 0
-      const completionTokens = Number(usage?.completion_tokens) || 0
-      const hasUsage = Boolean(usage)
-      const price = await lookupModelPrice(modelId, {
-        baseUrl: settings.baseUrl,
-        apiKey: settings.apiKey,
-        dataDir: DATA_DIR,
-      })
-      const { costCa } = calcTokenCostCa(price, promptTokens, completionTokens)
-      const priceKnown = costCa != null && hasUsage
-
-      const body = assistantText || '(空回复)'
-      const footer = hasUsage
-        ? buildCostFooter({
-            promptTokens,
-            completionTokens,
-            costCa,
-            priceKnown,
+    const result = await runAgentTurn({
+      guiRoot: GUI_ROOT,
+      prompt: text,
+      images,
+      planMode: Boolean(settings.planMode),
+      cwd: workCwd,
+      model: modelId,
+      apiKey: settings.apiKey,
+      baseUrl,
+      resumeSessionId: session.agentSessionId || null,
+      configDir,
+      signal: ac.signal,
+      onEvent: ev => {
+        touchHeartbeat()
+        if (closed) return
+        if (ev.type === 'delta' && ev.text) {
+          assistantText += ev.text
+          send('delta', { id: assistantId, text: ev.text })
+        } else if (ev.type === 'tool') {
+          const line = `\n[tool] ${ev.name}${ev.preview ? ` · ${ev.preview}` : ''}\n`
+          assistantText += line
+          send('tool', {
+            id: assistantId,
+            toolId: ev.id,
+            name: ev.name,
+            preview: ev.preview || '',
           })
-        : '费用：本轮用量未返回，无法计价'
+          send('delta', { id: assistantId, text: line })
+        } else if (ev.type === 'status' && ev.text) {
+          send('status', { id: assistantId, text: ev.text })
+        }
+      },
+    })
 
-      const content = `${body}\n\n---\n${footer}`
-      send('delta', { id: assistantId, text: `\n\n---\n${footer}` })
-
-      const assistantMsg = {
-        id: assistantId,
-        role: 'assistant',
-        content,
-        createdAt: new Date().toISOString(),
-        model: modelId,
-        usage: hasUsage
-          ? {
-              promptTokens,
-              completionTokens,
-              totalTokens: Number(usage?.total_tokens) || promptTokens + completionTokens,
-              costCa: priceKnown ? costCa : null,
-            }
-          : null,
-        costFooter: footer || null,
-      }
-      session.messages.push(assistantMsg)
-      session.updatedAt = new Date().toISOString()
-      writeSession(session)
-      send('done', {
-        message: assistantMsg,
-        session: {
-          id: session.id,
-          title: session.title,
-          updatedAt: session.updatedAt,
-        },
-      })
-    }
+    if (result.resumeCleared) session.agentSessionId = null
+    if (result.agentSessionId) session.agentSessionId = result.agentSessionId
+    if (!closed)
+      await finalizeAssistant(
+        assistantId,
+        result.text || assistantText,
+        result.usage,
+        result.usageDetail || null,
+      )
   } catch (err) {
     console.error('[openclaude-gui] chat error:', err)
     send('error', { error: err?.message || String(err) })
@@ -604,15 +700,17 @@ server.listen(PORT, HOST, () => {
   const url = `http://${HOST}:${PORT}`
   console.log(`[openclaude-gui] listening on ${url}`)
   console.log(`[openclaude-gui] data dir: ${DATA_DIR}`)
+  const cli = resolveOpenClaudeCli(GUI_ROOT)
+  console.log(
+    `[openclaude-gui] agent CLI: ${cli ? cli.label : 'NOT FOUND — agent mode unavailable'}`,
+  )
   if (DEV)
     console.log('[openclaude-gui] DEV mode: start UI with npm run dev:ui (proxied to this API)')
   if (LIFETIME)
     console.log(
       `[openclaude-gui] lifetime: exit if no UI heartbeat for ${HEARTBEAT_MS}ms`,
     )
-  if (OPEN_BROWSER) {
-    setTimeout(() => openBrowser(url), 400)
-  }
+  if (OPEN_BROWSER) setTimeout(() => openBrowser(url), 400)
 })
 
 if (LIFETIME) {

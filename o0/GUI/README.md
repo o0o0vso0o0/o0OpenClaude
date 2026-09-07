@@ -6,8 +6,16 @@
 
 - 左侧会话列表（右键删除）
 - 中间流式聊天
-- 对话框处选择模型（系列 Tab、按发布日排序、显示输入/输出价）
-- 设置：OpenAI 兼容 API（默认 ChatAnywhere `https://api.chatanywhere.tech/v1`）
+- **Agent harness**：调用本机 OpenClaude CLI（`--print` + `stream-json`），多轮工具循环；会话可 `--resume`
+- 模型选择、费用脚注、API Key / Base URL / 工作目录 cwd
+- **图片输入**：拖拽 / 粘贴 / 按钮选择图片到输入区，随消息发给 Agent（多模态 content blocks）
+
+## Agent 说明
+
+- 需要已编译的 CLI：`dist/cli.mjs`（开发）或 `Release/bin/openclaude`（打包）
+- 可用环境变量 `OPENCLAUDE_CLI` 指定 CLI 路径；`OPENCLAUDE_GUI_CWD` 指定默认工作目录
+- Agent 权限默认 `--dangerously-skip-permissions`（本机可信环境）
+- 多轮任务会在同一 OpenClaude session 内工具循环；GUI 同一会话再次发送会 `--resume`
 
 ## 一键测试（by o0）
 
