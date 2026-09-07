@@ -89,6 +89,8 @@ type RequestBodyPlannerContext = {
   maxTokensValue?: number
   maxCompletionTokensValue?: number
   getOllamaNumCtx: () => number
+  resolveOllamaThinkEnabled: () => boolean
+  resolveOllamaKeepAlive: () => string
   normalizeOllamaNativeMessages: (messages: unknown) => unknown
   useNativeOllamaChat: boolean
   fastPath: { skipStableStringify: boolean }
@@ -115,6 +117,8 @@ export function createRequestBodyPlanner(context: RequestBodyPlannerContext) {
     maxTokensValue,
     maxCompletionTokensValue,
     getOllamaNumCtx,
+    resolveOllamaThinkEnabled,
+    resolveOllamaKeepAlive,
     normalizeOllamaNativeMessages,
     useNativeOllamaChat,
     fastPath,
@@ -428,6 +432,8 @@ export function createRequestBodyPlanner(context: RequestBodyPlannerContext) {
       model: request.resolvedModel,
       messages: normalizeOllamaNativeMessages(body.messages),
       stream: params.stream ?? false,
+      think: resolveOllamaThinkEnabled(),
+      keep_alive: resolveOllamaKeepAlive(),
       options,
       ...(body.tools ? { tools: body.tools } : {}),
     }

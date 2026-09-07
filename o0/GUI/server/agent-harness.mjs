@@ -170,6 +170,7 @@ function runAgentTurnOnce(opts) {
     configDir = null,
     maxTurns = 50,
     planMode = false,
+    ollamaThink = false,
     onEvent = () => {},
     signal = null,
   } = opts
@@ -216,6 +217,7 @@ function runAgentTurnOnce(opts) {
     OPENAI_BASE_URL: String(baseUrl || '').replace(/\/+$/, ''),
     OPENAI_MODEL: String(model || ''),
   }
+  env.OPENCLAUDE_OLLAMA_THINK = ollamaThink ? '1' : '0'
   if (configDir) {
     env.OPENCLAUDE_CONFIG_DIR = configDir
     env.CLAUDE_CONFIG_DIR = configDir
@@ -236,12 +238,31 @@ function runAgentTurnOnce(opts) {
     /** @type {{ id: string, resolve: (v: any) => void, reject: (e: any) => void } | null} */
     let pendingContextReq = null
     let contextRequested = false
+    let lastThinkingStatusAt = 0
+    let inThinkingBlock = false
+
+    const localHint =
+      /11434|ollama/i.test(String(baseUrl || '')) ||
+      /^qwen3\.8:/i.test(String(model || ''))
+    onEvent({
+      type: 'status',
+      text: resumeId
+        ? '正在恢复会话并启动 Agent…'
+        : '正在启动 Agent…',
+    })
 
     const child = spawn(cli.node, args, {
       cwd: workCwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+    })
+
+    onEvent({
+      type: 'status',
+      text: localHint
+        ? '已启动，等待本地模型首 token（冷启动可能较久）…'
+        : '已启动，等待模型首包…',
     })
 
     const finish = (err, value) => {
@@ -436,9 +457,45 @@ function runAgentTurnOnce(opts) {
         const ev = msg.event
         if (
           ev.type === 'content_block_delta' &&
+          (ev.delta?.type === 'thinking_delta' ||
+            ev.delta?.type === 'reasoning_delta')
+        ) {
+          const chunk =
+            ev.delta.thinking ||
+            ev.delta.reasoning ||
+            ev.delta.text ||
+            ''
+          if (chunk) {
+            inThinkingBlock = true
+            onEvent({ type: 'thinking', text: String(chunk) })
+          }
+          const now = Date.now()
+          if (now - lastThinkingStatusAt > 1500) {
+            lastThinkingStatusAt = now
+            onEvent({ type: 'status', text: '模型思考中…' })
+          }
+        }
+        if (
+          ev.type === 'content_block_start' &&
+          (ev.content_block?.type === 'thinking' ||
+            ev.content_block?.type === 'reasoning')
+        ) {
+          inThinkingBlock = true
+          onEvent({ type: 'status', text: '模型开始思考…' })
+        }
+        if (ev.type === 'content_block_stop' && inThinkingBlock) {
+          inThinkingBlock = false
+          onEvent({ type: 'thinking_done' })
+        }
+        if (
+          ev.type === 'content_block_delta' &&
           ev.delta?.type === 'text_delta' &&
           ev.delta.text
         ) {
+          if (inThinkingBlock) {
+            inThinkingBlock = false
+            onEvent({ type: 'thinking_done' })
+          }
           assistantText += ev.delta.text
           onEvent({ type: 'delta', text: ev.delta.text })
         }
@@ -446,6 +503,10 @@ function runAgentTurnOnce(opts) {
           ev.type === 'content_block_start' &&
           ev.content_block?.type === 'tool_use'
         ) {
+          if (inThinkingBlock) {
+            inThinkingBlock = false
+            onEvent({ type: 'thinking_done' })
+          }
           const tu = ev.content_block
           const id = tu.id || `${tu.name}-${seenTools.size}`
           if (!seenTools.has(id)) {
@@ -458,6 +519,8 @@ function runAgentTurnOnce(opts) {
             })
           }
         }
+        if (ev.type === 'message_start')
+          onEvent({ type: 'status', text: '已收到模型响应，正在生成…' })
         return
       }
 

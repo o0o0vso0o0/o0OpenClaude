@@ -23,6 +23,7 @@ type OllamaChatResponse = {
   message?: {
     role?: string
     content?: string
+    thinking?: string
     tool_calls?: Array<{
       function?: {
         name?: string
@@ -60,6 +61,25 @@ export function getOllamaNumCtx(): number {
     parsePositiveIntegerEnv(process.env.OLLAMA_CONTEXT_LENGTH) ??
     MIN_RECOMMENDED_OLLAMA_CONTEXT_TOKENS
   )
+}
+
+/// <summary> AI Cursor </summary>
+export function resolveOllamaThinkEnabled(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = processEnv.OPENCLAUDE_OLLAMA_THINK?.trim().toLowerCase()
+  if (raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes') return true
+  if (raw === '0' || raw === 'false' || raw === 'off' || raw === 'no') return false
+  // Default off: Qwen3.x thinking is ON by default in Ollama and dominates latency.
+  return false
+}
+
+/// <summary> AI Cursor </summary>
+export function resolveOllamaKeepAlive(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): string {
+  const raw = processEnv.OLLAMA_KEEP_ALIVE?.trim()
+  return raw && raw.length > 0 ? raw : '24h'
 }
 
 export function buildOllamaChatUrl(baseUrl: string): string {
@@ -184,9 +204,20 @@ function convertOllamaChatResponseToOpenAI(
   makeMessageId: () => string,
 ): Record<string, unknown> {
   const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
+  const thinking =
+    typeof data.message?.thinking === 'string' ? data.message.thinking : ''
   return {
     id: makeMessageId(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: data.model ?? fallbackModel,
-    choices: [{ index: 0, message: { role: 'assistant', content: data.message?.content ?? '', ...(toolCalls ? { tool_calls: toolCalls } : {}) }, finish_reason: toolCalls ? 'tool_calls' : mapOllamaDoneReason(data.done_reason) }],
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: data.message?.content ?? '',
+        ...(thinking ? { reasoning_content: thinking } : {}),
+        ...(toolCalls ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: toolCalls ? 'tool_calls' : mapOllamaDoneReason(data.done_reason),
+    }],
     usage: buildOpenAIUsageFromOllama(data),
   }
 }
@@ -247,6 +278,8 @@ export function convertOllamaStreamingResponse(response: Response, fallbackModel
     const delta: Record<string, unknown> = {}
     if (!hasEmittedRole) { delta.role = 'assistant'; hasEmittedRole = true }
     if (data.message?.content) delta.content = data.message.content
+    if (typeof data.message?.thinking === 'string' && data.message.thinking)
+      delta.reasoning_content = data.message.thinking
     const toolCalls = normalizeOllamaToolCalls(data.message?.tool_calls)
     if (toolCalls) {
       hasEmittedToolCall = true

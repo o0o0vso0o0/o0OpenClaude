@@ -189,6 +189,18 @@ const ANTHROPIC_WIRE_PROVIDERS: ReadonlySet<LegacyAPIProvider> = new Set([
 ])
 
 /**
+ * AI Cursor
+ * True when tool_reference is NOT expanded by the API (OpenAI/Gemini/etc. shims).
+ * Client must embed schemas in ToolSearch results and inject discovered tools
+ * into the next request's tools array.
+ */
+export function isClientSideToolSearchOrchestration(
+  provider: LegacyAPIProvider = getAPIProvider(),
+): boolean {
+  return !ANTHROPIC_WIRE_PROVIDERS.has(provider)
+}
+
+/**
  * Pure resolver for the tool search mode — injectable env/provider for tests.
  */
 export function resolveToolSearchMode(
@@ -614,14 +626,38 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
 
     for (const block of content) {
       // tool_reference blocks only appear inside tool_result content, specifically
-      // in results from ToolSearchTool. The API expands these references into full
-      // tool definitions in the model's context.
+      // in results from ToolSearchTool. On Anthropic wire the API expands these;
+      // on OpenAI-compatible shims the client injects discovered tools next turn.
       if (isToolResultBlockWithContent(block)) {
         for (const item of block.content) {
           if (isToolReferenceWithName(item)) {
             discoveredTools.add(item.tool_name)
+          } else if (
+            typeof item === 'object' &&
+            item !== null &&
+            'type' in item &&
+            (item as { type: unknown }).type === 'text' &&
+            'text' in item &&
+            typeof (item as { text: unknown }).text === 'string'
+          ) {
+            addDiscoveredToolsFromToolResultText(
+              discoveredTools,
+              (item as { text: string }).text,
+            )
           }
         }
+      } else if (
+        typeof block === 'object' &&
+        block !== null &&
+        'type' in block &&
+        (block as { type: unknown }).type === 'tool_result' &&
+        'content' in block &&
+        typeof (block as { content: unknown }).content === 'string'
+      ) {
+        addDiscoveredToolsFromToolResultText(
+          discoveredTools,
+          (block as { content: string }).content,
+        )
       }
     }
   }
@@ -636,6 +672,39 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
   }
 
   return discoveredTools
+}
+
+/**
+ * AI Cursor
+ * Fallback discovery for OpenAI shims: ToolSearch results may be plain text
+ * ("Tool X is now loaded" / <function>{"name":...}) after conversion or
+ * when schemas are embedded client-side without relying solely on tool_reference.
+ */
+function addDiscoveredToolsFromToolResultText(
+  discoveredTools: Set<string>,
+  text: string,
+): void {
+  if (!text) return
+
+  for (const match of text.matchAll(
+    /Tool\s+"([^"]+)"\s+is now loaded/g,
+  )) {
+    if (match[1]) discoveredTools.add(match[1])
+  }
+
+  for (const match of text.matchAll(
+    /<function>\s*(\{[\s\S]*?\})\s*<\/function>/g,
+  )) {
+    const raw = match[1]
+    if (!raw) continue
+    try {
+      const parsed = JSON.parse(raw) as { name?: unknown }
+      if (typeof parsed.name === 'string' && parsed.name)
+        discoveredTools.add(parsed.name)
+    } catch {
+      // ignore malformed function lines
+    }
+  }
 }
 
 export type DeferredToolsDelta = {

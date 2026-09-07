@@ -9,6 +9,13 @@ type Props = {
 }
 
 /// <summary> AI Cursor </summary>
+function selectionMatches(m: ModelEntry, currentModel: string): boolean {
+  if (m.provider === 'ollama' || m.ollamaId)
+    return (m.ollamaId || m.id) === currentModel
+  return m.id === currentModel
+}
+
+/// <summary> AI Cursor </summary>
 export default function ModelPicker({ currentModel, onSelect, onClose }: Props) {
   const [catalog, setCatalog] = useState<ModelsCatalog | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -24,11 +31,14 @@ export default function ModelPicker({ currentModel, onSelect, onClose }: Props) 
       setCatalog(data)
       if (!tabId && data.tabs.length > 0) {
         const frequent = data.tabs.find(t => t.id === 'frequent')
+        const local = data.tabs.find(t => t.id === 'local')
         const hit = data.tabs.find(t =>
           t.models.some(m => m.id === currentModel),
         )
-        if (frequent && frequent.count > 0) setTabId('frequent')
-        else setTabId(hit?.id || data.tabs[0].id)
+        if (hit) setTabId(hit.id)
+        else if (local && local.count > 0) setTabId('local')
+        else if (frequent && frequent.count > 0) setTabId('frequent')
+        else setTabId(data.tabs[0].id)
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -59,6 +69,8 @@ export default function ModelPicker({ currentModel, onSelect, onClose }: Props) 
     return list.filter(
       m =>
         m.id.toLowerCase().includes(q) ||
+        (m.label || '').toLowerCase().includes(q) ||
+        (m.ollamaId || '').toLowerCase().includes(q) ||
         m.description.toLowerCase().includes(q) ||
         m.priceLabel.toLowerCase().includes(q),
     )
@@ -72,6 +84,11 @@ export default function ModelPicker({ currentModel, onSelect, onClose }: Props) 
             <h2>选择模型</h2>
             <p>
               {catalog?.currencyNote || '价格来自 ChatAnywhere 文档'}
+              {catalog?.localOllama
+                ? catalog.localOllama.online
+                  ? ' · 本地 Ollama 在线'
+                  : ' · 本地 Ollama 未检测到（仍可选手动条目）'
+                : ''}
               {catalog?.fetchedAt ? ` · ${new Date(catalog.fetchedAt).toLocaleString()}` : ''}
             </p>
           </div>
@@ -129,29 +146,51 @@ export default function ModelPicker({ currentModel, onSelect, onClose }: Props) 
                   : '此系列暂无模型'}
               </div>
             )}
-            {models.map(m => (
+            {models.map(m => {
+              const localMissing =
+                (m.provider === 'ollama' || Boolean(m.ollamaId)) && m.fromApi === false
+              return (
               <button
                 key={m.id}
                 type="button"
-                className={`model-row${m.id === currentModel ? ' selected' : ''}`}
-                onClick={() => onSelect(m.id)}
+                disabled={localMissing}
+                title={
+                  localMissing
+                    ? `未安装。请先执行：ollama pull ${m.ollamaId || m.id}`
+                    : undefined
+                }
+                className={`model-row${selectionMatches(m, currentModel) ? ' selected' : ''}${localMissing ? ' disabled' : ''}`}
+                onClick={() => {
+                  if (localMissing) return
+                  onSelect(m.id)
+                }}
               >
                 <div className="model-row-main">
-                  <div className="model-id">{m.id}</div>
+                  <div className="model-id">
+                    {m.label || m.ollamaId || m.id}
+                  </div>
                   <div className="model-price">{m.priceLabel}</div>
                 </div>
                 <div className="model-row-meta">
-                  {m.lastUsedLabel ? (
+                  {m.provider === 'ollama' || m.ollamaId ? (
+                    <span>{m.fromApi ? '已安装' : '未 pull · 需 ollama pull'}</span>
+                  ) : m.lastUsedLabel ? (
                     <span>上次使用 {m.lastUsedLabel}</span>
                   ) : m.createdLabel ? (
                     <span>发布 {m.createdLabel}</span>
                   ) : (
                     <span>发布日期未知</span>
                   )}
+                  {m.ollamaId ? (
+                    <span className="model-ollama-id" title={m.ollamaId}>
+                      {m.ollamaId}
+                    </span>
+                  ) : null}
                   {m.description ? <span title={m.description}>{m.description}</span> : null}
                 </div>
               </button>
-            ))}
+              )
+            })}
           </div>
         </div>
       </div>

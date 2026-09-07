@@ -204,6 +204,7 @@ import {
 } from 'src/utils/thinking.js'
 import {
   extractDiscoveredToolNames,
+  isClientSideToolSearchOrchestration,
   isDeferredToolsDeltaEnabled,
   isToolSearchEnabled,
 } from 'src/utils/toolSearch.js'
@@ -1567,6 +1568,14 @@ async function* queryModel(
   const injectChromeHere =
     useToolSearch && hasChromeTools && !isMcpInstructionsDeltaEnabled()
 
+  // AI Cursor — OpenAI/Gemini/etc. cannot expand tool_reference; steer the model
+  // to ToolSearch → next-turn tools injection (client-side progressive disclosure).
+  const CLIENT_SIDE_TOOL_SEARCH_INSTRUCTIONS =
+    'Deferred tools are omitted from your tools list until loaded — call ToolSearch first (select:ToolName or keywords), then use them on the next turn with full schemas. Always-loaded tools may show a short [d] stub description while keeping parameter schemas; call ToolSearch (e.g. select:Bash) when you need the full usage guidance. Do not invent parameters for tools you have not fetched.'
+
+  const injectClientSideToolSearch =
+    useToolSearch && isClientSideToolSearchOrchestration()
+
   const attributionEnabled = isAttributionHeaderEnabled()
 
   // Build the stable prompt here, but delay attribution and request blocks
@@ -1580,6 +1589,9 @@ async function* queryModel(
       ...systemPrompt,
       ...(advisorModel ? [ADVISOR_TOOL_INSTRUCTIONS] : []),
       ...(injectChromeHere ? [CHROME_TOOL_SEARCH_INSTRUCTIONS] : []),
+      ...(injectClientSideToolSearch
+        ? [CLIENT_SIDE_TOOL_SEARCH_INSTRUCTIONS]
+        : []),
     ].filter(Boolean),
   )
   const useBetas = betas.length > 0

@@ -263,6 +263,8 @@ test('uses max_tokens and request-level num_ctx for local Ollama', async () => {
 
   expect(requestUrl).toBe('http://localhost:11434/api/chat')
   expect(requestBody?.options).toMatchObject({ num_predict: 64, num_ctx: 32768 })
+  expect(requestBody?.think).toBe(false)
+  expect(requestBody?.keep_alive).toBe('24h')
   expect(requestBody?.stream_options).toBeUndefined()
 })
 

@@ -6,6 +6,7 @@ import fs from 'fs'
 import path from 'path'
 
 const SERIES_ORDER = [
+  'local',
   'claude',
   'gpt',
   'o',
@@ -18,6 +19,95 @@ const SERIES_ORDER = [
   'grok',
   'ca',
 ]
+
+/** Default local Ollama OpenAI-compatible endpoint */
+export const LOCAL_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1'
+export const LOCAL_OLLAMA_API_KEY = 'ollama'
+
+/** Built-in local deployments (one row per quant; Thinking is a separate toggle). */
+const LOCAL_OLLAMA_DEPLOYMENTS = [
+  {
+    ollamaId: 'qwen3.8:27b',
+    label: '千问3.8 · 27B · Q4',
+    description: '推荐（快，已验证可跑）',
+  },
+  {
+    ollamaId: 'qwen3.8:27b-q8_0',
+    label: '千问3.8 · 27B · Q8',
+    description: '更高保真，~30GB',
+  },
+  {
+    ollamaId: 'qwen3.8:27b-mxfp8',
+    label: '千问3.8 · 27B · FP8',
+    description: '~32GB；Windows/AMD 可能不稳定',
+  },
+  {
+    ollamaId: 'qwen3.8:27b-bf16',
+    label: '千问3.8 · 27B · BF16',
+    description: '~56GB；需大页面文件，加载峰值高',
+  },
+]
+
+/// <summary> AI Cursor </summary>
+export function localQuantTag(ollamaId) {
+  const id = String(ollamaId || '').toLowerCase()
+  if (!id) return ''
+  if (id.includes('bf16')) return 'BF16'
+  if (id.includes('mxfp8') || id.includes('fp8')) return 'FP8'
+  if (id.includes('q8')) return 'Q8'
+  if (id.includes('q6')) return 'Q6'
+  if (id.includes('q5')) return 'Q5'
+  if (id.includes('q4') || /^qwen3\.8:27b$/.test(id)) return 'Q4'
+  if (id.includes('q3')) return 'Q3'
+  if (id.includes('q2')) return 'Q2'
+  return ''
+}
+
+/// <summary> AI Cursor </summary>
+export function localModelLabel(ollamaId) {
+  const id = String(ollamaId || '').trim()
+  const known = LOCAL_OLLAMA_DEPLOYMENTS.find(d => d.ollamaId === id)
+  if (known?.label) return known.label
+  const quant = localQuantTag(id)
+  if (/^qwen3\.8:27b/i.test(id))
+    return `千问3.8 · 27B · ${quant || '本地'}`
+  return quant ? `${id} · ${quant}` : id || '未选模型'
+}
+
+/// <summary> AI Cursor </summary>
+export function localDisplayLabel(ollamaId, think) {
+  const base = localModelLabel(ollamaId)
+  if (!base) return '未选模型'
+  return `${base} · ${think ? 'Think开' : 'Think关'}`
+}
+
+/** @deprecated use LOCAL_OLLAMA_DEPLOYMENTS — kept for id checks */
+const LOCAL_OLLAMA_FALLBACK = LOCAL_OLLAMA_DEPLOYMENTS.map(d => ({
+  id: d.ollamaId,
+  description: d.description,
+}))
+
+/// <summary> AI Cursor </summary>
+export function localCatalogId(ollamaId, think) {
+  return `${String(ollamaId || '').trim()}|think=${think ? '1' : '0'}`
+}
+
+/// <summary> AI Cursor </summary>
+export function parseLocalModelSelection(selectionId) {
+  const raw = String(selectionId || '').trim()
+  const m = raw.match(/^(.*)\|think=([01])$/i)
+  if (m)
+    return {
+      model: m[1].trim(),
+      ollamaThink: m[2] === '1',
+      catalogId: raw,
+    }
+  return {
+    model: raw,
+    ollamaThink: null,
+    catalogId: raw,
+  }
+}
 
 const PRICING_DOC_URL = 'https://chatanywhere.apifox.cn/doc-2694962'
 const CACHE_TTL_MS = 60 * 60 * 1000
@@ -227,12 +317,34 @@ function parsePricingHtml(html) {
 }
 
 /// <summary> AI Cursor </summary>
+export function isLocalOllamaBaseUrl(baseUrl) {
+  const u = String(baseUrl || '').toLowerCase()
+  return (
+    u.includes('127.0.0.1:11434') ||
+    u.includes('localhost:11434') ||
+    u.includes('0.0.0.0:11434')
+  )
+}
+
+/// <summary> AI Cursor </summary>
+export function isLocalOllamaModelId(modelId) {
+  const parsed = parseLocalModelSelection(modelId)
+  const id = String(parsed.model || '').trim().toLowerCase()
+  if (!id) return false
+  if (LOCAL_OLLAMA_DEPLOYMENTS.some(m => m.ollamaId.toLowerCase() === id))
+    return true
+  // Ollama-style tags: name:tag
+  if (/^qwen3\.8:/.test(id)) return true
+  return false
+}
+
+/// <summary> AI Cursor </summary>
 async function fetchApiModels(baseUrl, apiKey) {
-  if (!apiKey) return []
+  if (!apiKey && !isLocalOllamaBaseUrl(baseUrl)) return []
   let u = String(baseUrl || '').replace(/\/+$/, '')
   if (!/\/v1$/i.test(u)) u = `${u}/v1`
   const res = await fetch(`${u}/models`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: { Authorization: `Bearer ${apiKey || LOCAL_OLLAMA_API_KEY}` },
   })
   if (!res.ok) throw new Error(`models API HTTP ${res.status}`)
   const json = await res.json()
@@ -244,6 +356,116 @@ async function fetchApiModels(baseUrl, apiKey) {
       ownedBy: String(m.owned_by || ''),
     }))
     .filter(m => m.id)
+}
+
+/// <summary> AI Cursor </summary>
+async function fetchLocalOllamaModels(localBaseUrl = LOCAL_OLLAMA_BASE_URL) {
+  /** @type {Map<string, object>} */
+  const byId = new Map()
+  /** @type {Set<string>} */
+  let onlineIds = new Set()
+
+  for (const d of LOCAL_OLLAMA_DEPLOYMENTS) {
+    byId.set(d.ollamaId, {
+      id: d.ollamaId,
+      ollamaId: d.ollamaId,
+      label: d.label || localModelLabel(d.ollamaId),
+      created: 0,
+      ownedBy: 'local-ollama',
+      description: d.description,
+      online: false,
+    })
+  }
+
+  try {
+    const listed = await fetchApiModels(localBaseUrl, LOCAL_OLLAMA_API_KEY)
+    onlineIds = new Set(listed.map(m => m.id))
+    for (const m of listed) {
+      const prev = byId.get(m.id)
+      if (prev) {
+        byId.set(m.id, {
+          ...prev,
+          created: m.created || 0,
+          online: true,
+        })
+        continue
+      }
+      if (!LOCAL_OLLAMA_DEPLOYMENTS.some(d => d.ollamaId === m.id)) {
+        byId.set(m.id, {
+          id: m.id,
+          ollamaId: m.id,
+          label: localModelLabel(m.id),
+          created: m.created || 0,
+          ownedBy: m.ownedBy || 'local-ollama',
+          description: '本地 Ollama',
+          online: true,
+        })
+      }
+    }
+  } catch {
+    /* Ollama down — keep fallbacks */
+  }
+
+  for (const entry of byId.values()) {
+    if (onlineIds.has(entry.ollamaId)) entry.online = true
+  }
+
+  return [...byId.values()]
+}
+
+/// <summary> AI Cursor </summary>
+function mergeLocalModels(catalog, localModels) {
+  const models = [...(catalog.models || [])]
+  const tabs = [...(catalog.tabs || [])].filter(t => t.id !== 'local')
+  const localEntries = (localModels || []).map(m => ({
+    id: m.id,
+    ollamaId: m.ollamaId || parseLocalModelSelection(m.id).model,
+    label:
+      m.label ||
+      localModelLabel(m.ollamaId || parseLocalModelSelection(m.id).model),
+    series: 'local',
+    created: m.created || 0,
+    createdLabel: m.created
+      ? new Date(m.created * 1000).toISOString().slice(0, 10)
+      : '',
+    ownedBy: m.ownedBy || 'local-ollama',
+    price: {
+      kind: 'token',
+      input: 0,
+      output: 0,
+      unit: '1K Tokens',
+      label: '本地',
+    },
+    priceLabel: '本地',
+    description: m.description || '本地 Ollama',
+    fromApi: Boolean(m.online),
+    fromPricing: false,
+    provider: 'ollama',
+    baseUrl: LOCAL_OLLAMA_BASE_URL,
+  }))
+
+  for (const entry of localEntries) {
+    const i = models.findIndex(x => x.id === entry.id)
+    if (i >= 0) models[i] = { ...models[i], ...entry }
+    else models.push(entry)
+  }
+
+  const localTab = {
+    id: 'local',
+    label: 'LOCAL',
+    count: localEntries.length,
+    models: localEntries,
+  }
+  return {
+    ...catalog,
+    models,
+    tabs: [localTab, ...tabs],
+    localOllama: {
+      baseUrl: LOCAL_OLLAMA_BASE_URL,
+      online: localEntries.some(m => m.fromApi),
+      count: localEntries.length,
+    },
+  }
 }
 
 /// <summary> AI Cursor </summary>
@@ -339,18 +561,40 @@ function buildCatalog(apiModels, pricingMap) {
 }
 
 /// <summary> AI Cursor </summary>
-export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false }) {
+export async function getModelsCatalog({
+  baseUrl,
+  apiKey,
+  dataDir,
+  force = false,
+  cloudBaseUrl = null,
+  cloudApiKey = null,
+  localBaseUrl = LOCAL_OLLAMA_BASE_URL,
+}) {
   const cachePath = path.join(dataDir, 'models-cache.json')
   const now = Date.now()
 
-  if (!force && memoryCache && now - memoryCache.at < CACHE_TTL_MS)
-    return memoryCache.catalog
+  // Always fetch cloud list from cloud endpoint (not current baseUrl if on Ollama).
+  const pricingBase = cloudBaseUrl ||
+    (isLocalOllamaBaseUrl(baseUrl) ? 'https://api.chatanywhere.tech/v1' : baseUrl)
+  const pricingKey =
+    cloudApiKey != null && String(cloudApiKey).trim()
+      ? String(cloudApiKey)
+      : isLocalOllamaBaseUrl(baseUrl)
+        ? ''
+        : apiKey
+
+  if (!force && memoryCache && now - memoryCache.at < CACHE_TTL_MS) {
+    const localModels = await fetchLocalOllamaModels(localBaseUrl)
+    return mergeLocalModels(memoryCache.catalog, localModels)
+  }
 
   if (!force && fs.existsSync(cachePath)) {
     try {
       const raw = JSON.parse(fs.readFileSync(cachePath, 'utf8'))
-      if (raw?.at && now - raw.at < CACHE_TTL_MS && raw.catalog?.tabs)
-        return raw.catalog
+      if (raw?.at && now - raw.at < CACHE_TTL_MS && raw.catalog?.tabs) {
+        const localModels = await fetchLocalOllamaModels(localBaseUrl)
+        return mergeLocalModels(raw.catalog, localModels)
+      }
     } catch {
       /* ignore */
     }
@@ -359,7 +603,7 @@ export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false
   let apiModels = []
   let apiError = null
   try {
-    apiModels = await fetchApiModels(baseUrl, apiKey)
+    apiModels = await fetchApiModels(pricingBase, pricingKey)
   } catch (e) {
     apiError = e?.message || String(e)
   }
@@ -373,7 +617,9 @@ export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false
     pricingError = e?.message || String(e)
   }
 
-  if (pricingMap.size === 0 && apiModels.length === 0) {
+  const localModels = await fetchLocalOllamaModels(localBaseUrl)
+
+  if (pricingMap.size === 0 && apiModels.length === 0 && localModels.length === 0) {
     throw new Error(
       `无法加载模型列表${apiError ? `（API: ${apiError}）` : ''}${
         pricingError ? `（定价文档: ${pricingError}）` : ''
@@ -387,6 +633,7 @@ export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false
   catalog.apiCount = apiModels.length
   catalog.pricingCount = pricingMap.size
 
+  // Cache cloud-only catalog; local list is merged fresh each time.
   memoryCache = { at: now, catalog }
   try {
     fs.mkdirSync(dataDir, { recursive: true })
@@ -394,7 +641,7 @@ export async function getModelsCatalog({ baseUrl, apiKey, dataDir, force = false
   } catch {
     /* ignore cache write */
   }
-  return catalog
+  return mergeLocalModels(catalog, localModels)
 }
 
 /// <summary> AI Cursor </summary>

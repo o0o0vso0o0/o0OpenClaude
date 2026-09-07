@@ -32,6 +32,8 @@ import {
 import {
   getOllamaNumCtx,
   normalizeOllamaNativeMessages,
+  resolveOllamaKeepAlive,
+  resolveOllamaThinkEnabled,
 } from './ollamaAdapter.js'
 import { createRequestBodyPlanner } from './requestPlanner.js'
 
@@ -379,6 +381,8 @@ export function prepareOpenAIRequest({
     maxTokensValue,
     maxCompletionTokensValue,
     getOllamaNumCtx,
+    resolveOllamaThinkEnabled,
+    resolveOllamaKeepAlive,
     normalizeOllamaNativeMessages,
     useNativeOllamaChat,
     fastPath,

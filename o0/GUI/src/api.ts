@@ -75,6 +75,8 @@ export type ChatMessage = {
   content: string
   createdAt: string
   model?: string
+  /** Model thinking / chain-of-thought (when Thinking is on). */
+  thinking?: string
   usage?: MessageUsage | null
   usageDetail?: UsageDetail | null
   costFooter?: string | null
@@ -105,6 +107,8 @@ export type SettingsPublic = {
   apiKeyPreview?: string
   cwd?: string
   planMode?: boolean
+  ollamaThink?: boolean
+  provider?: 'ollama' | 'openai' | string
   agentCli?: string | null
   agentReady?: boolean
 }
@@ -125,9 +129,16 @@ export type ModelEntry = {
   createdLabel: string
   priceLabel: string
   description: string
+  /** Human label for local Ollama rows (includes quant). */
+  label?: string
   price: ModelPrice | null
   lastUsedAt?: string
   lastUsedLabel?: string
+  provider?: string
+  baseUrl?: string
+  ollamaId?: string
+  ollamaThink?: boolean
+  fromApi?: boolean
 }
 
 export type ModelsCatalog = {
@@ -137,6 +148,30 @@ export type ModelsCatalog = {
   fetchedAt?: string
   apiError?: string | null
   pricingError?: string | null
+  localOllama?: { baseUrl: string; online: boolean; count: number }
+}
+
+export type OllamaLoadedModel = {
+  name: string
+  model: string
+  size: number
+  sizeVram: number
+  sizeLabel: string
+  details?: {
+    parent_model?: string
+    format?: string
+    family?: string
+    parameter_size?: string
+    quantization_level?: string
+  } | null
+  expiresAt?: string | null
+}
+
+export type OllamaLoadedResponse = {
+  ok: boolean
+  baseUrl?: string
+  models: OllamaLoadedModel[]
+  error?: string
 }
 
 /// <summary> AI Cursor </summary>
@@ -164,6 +199,7 @@ export async function saveSettings(body: {
   model?: string
   cwd?: string
   planMode?: boolean
+  ollamaThink?: boolean
   clearApiKey?: boolean
 }): Promise<SettingsPublic> {
   return parseJson(
@@ -171,6 +207,22 @@ export async function saveSettings(body: {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }),
+  )
+}
+
+/// <summary> AI Cursor </summary>
+export async function fetchOllamaLoaded(): Promise<OllamaLoadedResponse> {
+  return parseJson(await fetch('/api/ollama/loaded'))
+}
+
+/// <summary> AI Cursor </summary>
+export async function unloadOllamaModel(model: string): Promise<{ ok: boolean; model: string }> {
+  return parseJson(
+    await fetch('/api/ollama/unload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
     }),
   )
 }
@@ -224,6 +276,10 @@ export type StreamHandlers = {
   onUser: (msg: ChatMessage) => void
   onAssistantStart: (id: string) => void
   onDelta: (id: string, text: string) => void
+  onThinking?: (id: string, text: string) => void
+  onThinkingDone?: (id: string) => void
+  onStatus?: (id: string, text: string) => void
+  onTool?: (id: string, tool: { toolId: string; name: string; preview?: string }) => void
   onDone: (msg: ChatMessage, sessionMeta: { id: string; title: string; updatedAt: string }) => void
   onError: (message: string) => void
 }
@@ -306,6 +362,18 @@ export async function streamChat(
         handlers.onAssistantStart(String(data.id))
       else if (eventName === 'delta')
         handlers.onDelta(String(data.id), String(data.text || ''))
+      else if (eventName === 'thinking')
+        handlers.onThinking?.(String(data.id), String(data.text || ''))
+      else if (eventName === 'thinking_done')
+        handlers.onThinkingDone?.(String(data.id || ''))
+      else if (eventName === 'status')
+        handlers.onStatus?.(String(data.id || ''), String(data.text || ''))
+      else if (eventName === 'tool')
+        handlers.onTool?.(String(data.id || ''), {
+          toolId: String(data.toolId || ''),
+          name: String(data.name || 'Tool'),
+          preview: data.preview ? String(data.preview) : '',
+        })
       else if (eventName === 'done')
         handlers.onDone(
           data.message as ChatMessage,

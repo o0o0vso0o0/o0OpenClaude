@@ -25,7 +25,16 @@ import {
   streamChat,
 } from './api'
 import ModelPicker from './ModelPicker'
+import OllamaVramPanel from './OllamaVramPanel'
 import UsageDetailModal from './UsageDetailModal'
+import { localModelLabel } from './localModelLabel'
+import {
+  classifyStreamPhase,
+  estimateRemainingSec,
+  formatEtaSec,
+  recordEtaSample,
+  type StreamPhase,
+} from './streamEta'
 
 const MAX_PENDING_IMAGES = 6
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -36,6 +45,8 @@ function isLikelyVisionModel(modelId: string): boolean {
   if (!id) return false
   if (/vision|gpt-4o|gpt-4\.1|gpt-5|o[1-9]|claude|gemini|qwen.*(vl|vision)|glm-4v|llava/.test(id))
     return true
+  // Local Qwen3.8 is natively multimodal.
+  if (/^qwen3\.8:/.test(id)) return true
   // DeepSeek: only *-vision* variants accept images (official docs).
   if (/deepseek/.test(id)) return /vision/.test(id)
   return false
@@ -109,9 +120,23 @@ export default function App() {
   const [title, setTitle] = useState('新会话')
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [streamProgress, setStreamProgress] = useState<{
+    assistantId: string | null
+    status: string
+    steps: { kind: 'status' | 'tool'; text: string }[]
+    startedAt: number
+    phase: StreamPhase
+    phaseStartedAt: number
+    firstTokenAt: number | null
+    contentChars: number
+    toolCount: number
+    etaSec: number | null
+  } | null>(null)
+  const [elapsedSec, setElapsedSec] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  const [vramPanelOpen, setVramPanelOpen] = useState(false)
   const [settings, setSettings] = useState<SettingsPublic | null>(null)
   const [formKey, setFormKey] = useState('')
   const [formBase, setFormBase] = useState('https://api.chatanywhere.tech/v1')
@@ -121,6 +146,8 @@ export default function App() {
   const [pendingImages, setPendingImages] = useState<ChatImage[]>([])
   const [dragOver, setDragOver] = useState(false)
   const [planMode, setPlanMode] = useState(false)
+  /** Controlled expand state for per-message thinking panels. */
+  const [thinkingOpen, setThinkingOpen] = useState<Record<string, boolean>>({})
   const [usageModal, setUsageModal] = useState<{
     messageId: string
     costLabel: string
@@ -169,7 +196,58 @@ export default function App() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, busy])
+  }, [messages, busy, streamProgress, elapsedSec])
+
+  useEffect(() => {
+    if (!busy || !streamProgress?.startedAt) {
+      setElapsedSec(0)
+      return
+    }
+    const isLocal =
+      settings?.provider === 'ollama' ||
+      /11434|ollama/i.test(String(settings?.baseUrl || ''))
+    const model = settings?.model || formModel
+    const tick = () => {
+      const now = Date.now()
+      const elapsed = Math.max(0, Math.floor((now - streamProgress.startedAt) / 1000))
+      setElapsedSec(elapsed)
+      setStreamProgress(prev => {
+        if (!prev) return prev
+        const phaseElapsed = Math.max(0, (now - prev.phaseStartedAt) / 1000)
+        const etaSec = estimateRemainingSec({
+          isLocal,
+          model,
+          phase: prev.phase,
+          elapsedSec: elapsed,
+          phaseElapsedSec: phaseElapsed,
+          hasContent: prev.contentChars > 0,
+          contentChars: prev.contentChars,
+          toolCount: prev.toolCount,
+          firstTokenSec:
+            prev.firstTokenAt != null
+              ? Math.max(0.1, (prev.firstTokenAt - prev.startedAt) / 1000)
+              : null,
+        })
+        if (prev.etaSec === etaSec) return prev
+        return { ...prev, etaSec }
+      })
+    }
+    tick()
+    const id = window.setInterval(tick, 500)
+    return () => window.clearInterval(id)
+  }, [
+    busy,
+    streamProgress?.startedAt,
+    streamProgress?.phase,
+    streamProgress?.phaseStartedAt,
+    streamProgress?.contentChars,
+    streamProgress?.toolCount,
+    streamProgress?.firstTokenAt,
+    settings?.provider,
+    settings?.baseUrl,
+    settings?.model,
+    formModel,
+  ])
 
   useEffect(() => startGuiLifetimeHeartbeat(), [])
 
@@ -219,6 +297,8 @@ export default function App() {
       const saved = await saveSettings({ model: modelId })
       setSettings(saved)
       setFormModel(saved.model)
+      setFormBase(saved.baseUrl)
+      if (saved.apiKey) setFormKey(saved.apiKey)
       setModelPickerOpen(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -255,6 +335,17 @@ export default function App() {
       setPlanMode(Boolean(saved.planMode))
     } catch (e) {
       setPlanMode(!next)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  async function onToggleOllamaThink() {
+    const next = !Boolean(settings?.ollamaThink)
+    setError(null)
+    try {
+      const saved = await saveSettings({ ollamaThink: next })
+      setSettings(saved)
+    } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
@@ -299,13 +390,74 @@ export default function App() {
 
     const text = input.trim()
     const images = [...pendingImages]
+    const isLocal =
+      settings?.provider === 'ollama' ||
+      /11434|ollama/i.test(String(settings?.baseUrl || ''))
+    const turnStartedAt = Date.now()
     setInput('')
     setPendingImages([])
     setBusy(true)
     setError(null)
+    setStreamProgress({
+      assistantId: null,
+      status: '正在发送…',
+      steps: [{ kind: 'status', text: '正在发送…' }],
+      startedAt: turnStartedAt,
+      phase: 'sending',
+      phaseStartedAt: turnStartedAt,
+      firstTokenAt: null,
+      contentChars: 0,
+      toolCount: 0,
+      etaSec: null,
+    })
 
-    const assistantId = `tmp-${Date.now()}`
+    let liveAssistantId: string | null = null
+    let firstTokenAt: number | null = null
     abortRef.current = new AbortController()
+
+    const pushProgress = (
+      kind: 'status' | 'tool',
+      progressText: string,
+      assistantMsgId?: string,
+    ) => {
+      setStreamProgress(prev => {
+        const now = Date.now()
+        const base = prev || {
+          assistantId: null,
+          status: '',
+          steps: [] as { kind: 'status' | 'tool'; text: string }[],
+          startedAt: now,
+          phase: 'unknown' as StreamPhase,
+          phaseStartedAt: now,
+          firstTokenAt: null,
+          contentChars: 0,
+          toolCount: 0,
+          etaSec: null,
+        }
+        const steps = [...base.steps]
+        const last = steps[steps.length - 1]
+        let toolCount = base.toolCount
+        if (!(last && last.kind === kind && last.text === progressText)) {
+          steps.push({ kind, text: progressText })
+          if (kind === 'tool') toolCount += 1
+        }
+        const status = kind === 'status' ? progressText : base.status || progressText
+        const phase = classifyStreamPhase(status, {
+          hasContent: base.contentChars > 0,
+          lastStepKind: kind,
+        })
+        const phaseChanged = phase !== base.phase
+        return {
+          ...base,
+          assistantId: assistantMsgId || base.assistantId,
+          status,
+          steps: steps.slice(-24),
+          phase,
+          phaseStartedAt: phaseChanged ? now : base.phaseStartedAt,
+          toolCount,
+        }
+      })
+    }
 
     try {
       await streamChat(
@@ -314,6 +466,23 @@ export default function App() {
         {
           onUser: msg => setMessages(prev => [...prev, msg]),
           onAssistantStart: id => {
+            liveAssistantId = id
+            setStreamProgress(prev =>
+              prev
+                ? { ...prev, assistantId: id, status: prev.status || '等待模型…' }
+                : {
+                    assistantId: id,
+                    status: '等待模型…',
+                    steps: [{ kind: 'status', text: '等待模型…' }],
+                    startedAt: Date.now(),
+                    phase: 'wait_first' as StreamPhase,
+                    phaseStartedAt: Date.now(),
+                    firstTokenAt: null,
+                    contentChars: 0,
+                    toolCount: 0,
+                    etaSec: null,
+                  },
+            )
             setMessages(prev => [
               ...prev,
               {
@@ -325,13 +494,76 @@ export default function App() {
             ])
           },
           onDelta: (id, delta) => {
+            const now = Date.now()
+            if (firstTokenAt == null && String(delta || '').trim()) firstTokenAt = now
+            setStreamProgress(prev => {
+              if (!prev) return prev
+              const nextChars = prev.contentChars + String(delta || '').length
+              const phase =
+                prev.phase === 'generating' || prev.phase === 'tool'
+                  ? prev.phase
+                  : ('generating' as StreamPhase)
+              return {
+                ...prev,
+                contentChars: nextChars,
+                firstTokenAt: prev.firstTokenAt ?? (String(delta || '').trim() ? now : null),
+                phase,
+                phaseStartedAt: phase !== prev.phase ? now : prev.phaseStartedAt,
+                status:
+                  prev.phase === 'generating' || prev.phase === 'tool'
+                    ? prev.status
+                    : '正在生成…',
+              }
+            })
             setMessages(prev =>
               prev.map(m =>
                 m.id === id ? { ...m, content: m.content + delta } : m,
               ),
             )
           },
+          onThinking: (id, chunk) => {
+            if (!chunk) return
+            setThinkingOpen(prev =>
+              prev[id] ? prev : { ...prev, [id]: true },
+            )
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === id
+                  ? { ...m, thinking: (m.thinking || '') + chunk }
+                  : m,
+              ),
+            )
+            requestAnimationFrame(() => {
+              const el = document.querySelector(
+                `[data-thinking-body="${CSS.escape(id)}"]`,
+              ) as HTMLElement | null
+              if (el) el.scrollTop = el.scrollHeight
+            })
+          },
+          onThinkingDone: id => {
+            if (!id) return
+            setThinkingOpen(prev => ({ ...prev, [id]: false }))
+          },
+          onStatus: (id, statusText) => {
+            if (statusText) pushProgress('status', statusText, id || undefined)
+          },
+          onTool: (id, tool) => {
+            const label = `调用工具 ${tool.name}${tool.preview ? ` · ${tool.preview}` : ''}`
+            pushProgress('tool', label, id || undefined)
+          },
           onDone: (msg, meta) => {
+            const turnSec = Math.max(0.5, (Date.now() - turnStartedAt) / 1000)
+            const ttftSec =
+              firstTokenAt != null
+                ? Math.max(0.2, (firstTokenAt - turnStartedAt) / 1000)
+                : null
+            recordEtaSample({
+              model: activeModel,
+              isLocal,
+              ttftSec,
+              turnSec,
+            })
+            setThinkingOpen(prev => ({ ...prev, [msg.id]: false }))
             setMessages(prev => prev.map(m => (m.id === msg.id ? msg : m)))
             setTitle(meta.title)
             void refreshSessions()
@@ -349,9 +581,11 @@ export default function App() {
           ? '发送失败：本地服务已断开或崩溃。请重新运行「测试 by o0」，并查看 o0\\.cache\\gui-server.log'
           : msg,
       )
-      setMessages(prev => prev.filter(m => m.id !== assistantId))
+      if (liveAssistantId)
+        setMessages(prev => prev.filter(m => m.id !== liveAssistantId))
     } finally {
       setBusy(false)
+      setStreamProgress(null)
       abortRef.current = null
     }
   }
@@ -468,7 +702,19 @@ export default function App() {
           <h1>{title}</h1>
           <div className="sidebar-actions">
             <button type="button" className="btn btn-ghost" onClick={() => setModelPickerOpen(true)}>
-              {settings?.apiKeySet ? `模型 ${settings.model}` : '未配置 API'}
+              {settings?.apiKeySet || settings?.provider === 'ollama'
+                ? settings?.provider === 'ollama'
+                  ? `本地 · ${localModelLabel(settings.model)}`
+                  : `模型 ${settings.model}`
+                : '未配置 API'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              title="查看并卸载显存中的本地模型"
+              onClick={() => setVramPanelOpen(true)}
+            >
+              显存
             </button>
           </div>
         </div>
@@ -477,7 +723,11 @@ export default function App() {
           {messages.length === 0 && (
             <div className="empty">
               <h2>开始对话</h2>
-              <p>发送消息将通过 OpenClaude harness 多轮调用工具。请先在设置中填写 API Key 与工作目录 cwd。</p>
+              <p>
+                {settings?.provider === 'ollama'
+                  ? '当前为本地 Ollama（Q4/Q8/FP8/BF16；Thinking 用输入框旁 Think 按钮切换）。发送消息将通过 OpenClaude harness 调用工具；请确认工作目录 cwd 已设置。'
+                  : '发送消息将通过 OpenClaude harness 多轮调用工具。请先在设置中填写 API Key 与工作目录 cwd。'}
+              </p>
             </div>
           )}
           {messages.map(m => {
@@ -500,7 +750,64 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                <div className="msg-body">{body || (busy ? '…' : '')}</div>
+                {m.thinking ? (
+                  <details
+                    className="msg-thinking"
+                    open={thinkingOpen[m.id] === true}
+                    onToggle={e => {
+                      const next = (e.currentTarget as HTMLDetailsElement).open
+                      setThinkingOpen(prev => ({ ...prev, [m.id]: next }))
+                    }}
+                  >
+                    <summary>
+                      思考
+                      {busy &&
+                      streamProgress?.assistantId === m.id &&
+                      thinkingOpen[m.id]
+                        ? '中…'
+                        : ''}
+                    </summary>
+                    <div
+                      className="msg-thinking-body"
+                      data-thinking-body={m.id}
+                    >
+                      {m.thinking}
+                    </div>
+                  </details>
+                ) : null}
+                <div className="msg-body">
+                  {body ||
+                    (busy && streamProgress?.assistantId === m.id ? (
+                      <span className="stream-waiting">等待模型输出…</span>
+                    ) : (
+                      ''
+                    ))}
+                </div>
+                {busy && streamProgress?.assistantId === m.id && (
+                  <div className="stream-progress" aria-live="polite">
+                    <div className="stream-progress-meta">
+                      <span className="stream-progress-status">
+                        {streamProgress.status || '处理中…'}
+                      </span>
+                      <span className="stream-timing">
+                        <span>已等待 {elapsedSec}s</span>
+                        <span className="stream-eta">
+                          预计剩余 {formatEtaSec(streamProgress.etaSec)}
+                        </span>
+                      </span>
+                    </div>
+                    {streamProgress.steps.length > 0 && (
+                      <ul className="stream-steps">
+                        {streamProgress.steps.slice(-8).map((step, i) => (
+                          <li key={`${step.kind}-${i}-${step.text}`} className={`stream-step ${step.kind}`}>
+                            {step.kind === 'tool' ? '⚙ ' : '· '}
+                            {step.text}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
                 {cost && (
                   <button
                     type="button"
@@ -585,6 +892,21 @@ export default function App() {
               >
                 Plan
               </button>
+              {settings?.provider === 'ollama' && (
+                <button
+                  type="button"
+                  className={`btn plan-toggle${settings?.ollamaThink ? ' active' : ''}`}
+                  title={
+                    settings?.ollamaThink
+                      ? 'Thinking 开：模型先思考再回答（更慢）'
+                      : 'Thinking 关：直接回答（更快）'
+                  }
+                  disabled={busy}
+                  onClick={() => void onToggleOllamaThink()}
+                >
+                  Think
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn-primary"
@@ -606,6 +928,8 @@ export default function App() {
           onClose={() => setModelPickerOpen(false)}
         />
       )}
+
+      {vramPanelOpen && <OllamaVramPanel onClose={() => setVramPanelOpen(false)} />}
 
       {usageModal && (
         <UsageDetailModal
@@ -644,7 +968,11 @@ export default function App() {
               />
             </div>
             <div className="field">
-              <label>API Key</label>
+              <label>
+                {settings?.provider === 'ollama'
+                  ? '云端 API Key（切回云端模型时使用）'
+                  : 'API Key'}
+              </label>
               <input
                 type="text"
                 value={formKey}
@@ -653,6 +981,12 @@ export default function App() {
                 autoComplete="off"
                 spellCheck={false}
               />
+              {settings?.provider === 'ollama' && (
+                <p className="hint">
+                  当前正在用本地 Ollama，无需本地 Key；此处保存的是云端 Key，不会写成
+                  ollama。
+                </p>
+              )}
             </div>
             {settings?.agentCli && (
               <p className="hint">CLI: {settings.agentCli}</p>

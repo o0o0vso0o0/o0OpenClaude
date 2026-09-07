@@ -50,6 +50,16 @@ Query forms:
 - "notebook jupyter" — keyword search, up to max_results best matches
 - "+slack send" — require "slack" in the name, rank by remaining terms`
 
+// AI Cursor — stronger guidance when the API does not expand tool_reference
+const PROMPT_TAIL_CLIENT_SIDE = ` Deferred tools are NOT in your tools list until you fetch them — calling them before ToolSearch will fail. Always-loaded tools may appear with a short \`[d]\` stub description and full parameter schemas; call ToolSearch (\`select:ToolName\` or keywords) to fetch the complete usage guidance inside a <functions> block before relying on nuanced behavior. After searching a deferred tool, it is also injected into your tools list on the next turn. Never invent parameters for a deferred tool you have not fetched.
+
+Result format: each matched tool appears as one <function>{"description": "...", "name": "...", "parameters": {...}}</function> line inside the <functions> block.
+
+Query forms:
+- "select:Bash,WebSearch,mcp__github__search_code" — fetch these exact tools by name (full docs / deferred load)
+- "notebook jupyter" — keyword search, up to max_results best matches
+- "+slack send" — require "slack" in the name, rank by remaining terms`
+
 /**
  * Check if a tool should be deferred (requires ToolSearch to load).
  * A tool is deferred if:
@@ -117,5 +127,12 @@ export function formatDeferredToolLine(tool: Tool): string {
 }
 
 export function getPrompt(): string {
-  return PROMPT_HEAD + getToolLocationHint() + PROMPT_TAIL
+  // Lazy import avoids a circular dependency with toolSearch.ts → prompt.ts
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { isClientSideToolSearchOrchestration } =
+    require('../../utils/toolSearch.js') as typeof import('../../utils/toolSearch.js')
+  const tail = isClientSideToolSearchOrchestration()
+    ? PROMPT_TAIL_CLIENT_SIDE
+    : PROMPT_TAIL
+  return PROMPT_HEAD + getToolLocationHint() + tail
 }

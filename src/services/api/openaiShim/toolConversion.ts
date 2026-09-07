@@ -74,32 +74,35 @@ export function convertTools(
     !options.disableStrictTools &&
     !options.skipStrict
 
-  return tools
-    .filter(tool => tool.name !== 'ToolSearchTool')
-    .map(tool => {
-      const schema = {
-        ...(tool.input_schema ?? { type: 'object', properties: {} }),
-      } as Record<string, unknown>
+  // Keep ToolSearch on the OpenAI wire so the client can orchestrate
+  // progressive disclosure (search → inject discovered tools next turn).
+  // Do not strip it; Anthropic-style server expansion is unavailable here.
+  // Keep full parameter schemas (never empty) — OpenAI-compatible models
+  // need them to call tools; opencode-tool-search learned the same lesson.
+  return tools.map(tool => {
+    const schema = {
+      ...(tool.input_schema ?? { type: 'object', properties: {} }),
+    } as Record<string, unknown>
 
-      if (tool.name === 'Agent' && schema.properties) {
-        const properties = schema.properties as Record<string, unknown>
-        schema.required = Array.isArray(schema.required) ? [...schema.required] : []
-        const required = schema.required as string[]
-        for (const key of ['message', 'subagent_type']) {
-          if (key in properties && !required.includes(key)) required.push(key)
-        }
+    if (tool.name === 'Agent' && schema.properties) {
+      const properties = schema.properties as Record<string, unknown>
+      schema.required = Array.isArray(schema.required) ? [...schema.required] : []
+      const required = schema.required as string[]
+      for (const key of ['message', 'subagent_type']) {
+        if (key in properties && !required.includes(key)) required.push(key)
       }
+    }
 
-      return {
-        type: 'function' as const,
-        function: {
-          name: tool.name,
-          description: tool.description ?? '',
-          parameters: (options.normalizeSchema ?? normalizeSchemaForOpenAI)(
-            schema,
-            strict,
-          ),
-        },
-      }
-    })
+    return {
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description ?? '',
+        parameters: (options.normalizeSchema ?? normalizeSchemaForOpenAI)(
+          schema,
+          strict,
+        ),
+      },
+    }
+  })
 }

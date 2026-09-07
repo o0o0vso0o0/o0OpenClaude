@@ -79,6 +79,46 @@ test('toolToAPISchema keeps skill required for SkillTool', async () => {
   })
 })
 
+test('toolToAPISchema stubs long descriptions on OpenAI path but keeps parameters', async () => {
+  const prevStub = process.env.CLAUDE_CODE_TOOL_DESC_STUB
+  const prevOpenAI = process.env.CLAUDE_CODE_USE_OPENAI
+  process.env.CLAUDE_CODE_TOOL_DESC_STUB = '1'
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  try {
+    const schema = await toolToAPISchema(
+      {
+        name: 'Bash',
+        searchHint: 'run shell commands',
+        inputSchema: z.strictObject({
+          command: z.string(),
+        }),
+        prompt: async () =>
+          'A very long bash tool prompt with lots of git and safety rules that should not appear on the wire when stubbing is enabled.',
+      } as unknown as Tool,
+      {
+        getToolPermissionContext: async () => getEmptyToolPermissionContext(),
+        tools: [] as unknown as Tools,
+        agents: [],
+      },
+    )
+
+    expect(schema).toMatchObject({
+      name: 'Bash',
+      description: '[d] run shell commands',
+    })
+    expect(
+      (schema as { description: string }).description.includes('git and safety'),
+    ).toBe(false)
+    expect((schema as { input_schema: { properties?: unknown } }).input_schema)
+      .toBeDefined()
+  } finally {
+    if (prevStub === undefined) delete process.env.CLAUDE_CODE_TOOL_DESC_STUB
+    else process.env.CLAUDE_CODE_TOOL_DESC_STUB = prevStub
+    if (prevOpenAI === undefined) delete process.env.CLAUDE_CODE_USE_OPENAI
+    else process.env.CLAUDE_CODE_USE_OPENAI = prevOpenAI
+  }
+})
+
 test('toolToAPISchema removes extra required keys not in properties (MCP schema sanitization)', async () => {
   const schema = await toolToAPISchema(
     {

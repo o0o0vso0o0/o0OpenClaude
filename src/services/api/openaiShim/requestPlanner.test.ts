@@ -32,6 +32,8 @@ function createPlanner(
     convertToolsToResponsesTools: (tools) =>
       tools.map((tool) => ({ type: 'function', name: tool.name })),
     getOllamaNumCtx: () => 32_768,
+    resolveOllamaThinkEnabled: () => false,
+    resolveOllamaKeepAlive: () => '24h',
     normalizeOllamaNativeMessages: (messages) => messages,
     useNativeOllamaChat: false,
     fastPath: { skipStableStringify: false },
@@ -331,6 +333,8 @@ describe('serialization and retry state', () => {
       model: 'llama',
       messages: [{ role: 'user', content: 'hello' }],
       stream: true,
+      think: false,
+      keep_alive: '24h',
       options: {
         num_ctx: 32_768,
         num_predict: 42,

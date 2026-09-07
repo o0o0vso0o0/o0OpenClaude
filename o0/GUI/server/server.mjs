@@ -15,6 +15,11 @@ import {
   lookupModelPrice,
   calcTokenCostCa,
   buildCostFooter,
+  isLocalOllamaBaseUrl,
+  isLocalOllamaModelId,
+  parseLocalModelSelection,
+  LOCAL_OLLAMA_API_KEY,
+  LOCAL_OLLAMA_BASE_URL,
 } from './models-catalog.mjs'
 import { resolveOpenClaudeCli, runAgentTurn, findSessionJsonl } from './agent-harness.mjs'
 import { analyzeSessionJsonl, buildUsageDetail } from './usage-analysis.mjs'
@@ -86,12 +91,97 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   baseUrl: 'https://api.chatanywhere.tech/v1',
   model: 'gpt-4o-mini',
+  /** Remembered cloud endpoint when switching to local Ollama */
+  cloudBaseUrl: 'https://api.chatanywhere.tech/v1',
+  cloudApiKey: '',
+  localBaseUrl: LOCAL_OLLAMA_BASE_URL,
+  localApiKey: LOCAL_OLLAMA_API_KEY,
   /** Agent 工作目录（仓库根） */
   cwd: '',
   /** Plan mode：只读规划，限制写文件 */
   planMode: false,
+  /** Local Ollama: pass think:true to /api/chat (Qwen3.x) */
+  ollamaThink: false,
   /** @type {Record<string, string>} modelId -> ISO last-used time */
   modelLastUsed: {},
+}
+
+/// <summary> AI Cursor </summary>
+function isLocalPlaceholderKey(key) {
+  const k = String(key || '').trim().toLowerCase()
+  return !k || k === 'ollama' || k === 'local' || k === '********'
+}
+
+/// <summary> AI Cursor </summary>
+function settingsPublic(s) {
+  const local = isLocalOllamaBaseUrl(s.baseUrl) || isLocalOllamaModelId(s.model)
+  const cloudKey = String(s.cloudApiKey || '').trim()
+  const activeKey = String(s.apiKey || '').trim()
+  // Settings UI edits the cloud key; local Ollama uses placeholder "ollama" internally.
+  const keyForUi = local
+    ? cloudKey && !isLocalPlaceholderKey(cloudKey)
+      ? cloudKey
+      : ''
+    : activeKey && !isLocalPlaceholderKey(activeKey)
+      ? activeKey
+      : cloudKey && !isLocalPlaceholderKey(cloudKey)
+        ? cloudKey
+        : ''
+  const cli = resolveOpenClaudeCli(GUI_ROOT)
+  return {
+    baseUrl: s.baseUrl,
+    model: s.model,
+    cwd: s.cwd || '',
+    planMode: Boolean(s.planMode),
+    ollamaThink: Boolean(s.ollamaThink),
+    apiKey: keyForUi,
+    apiKeySet: Boolean(keyForUi) || local,
+    apiKeyPreview: keyForUi
+      ? `${keyForUi.slice(0, 4)}…${keyForUi.slice(-4)}`
+      : local
+        ? 'local'
+        : '',
+    provider: local ? 'ollama' : 'openai',
+    agentCli: cli?.label || null,
+    agentReady: Boolean(cli),
+  }
+}
+
+/// <summary> AI Cursor </summary>
+function applyModelEndpointSwitch(next, cur) {
+  const model = String(next.model || '').trim()
+  const wantLocal = isLocalOllamaModelId(model)
+  const curLocal =
+    isLocalOllamaBaseUrl(cur.baseUrl) || isLocalOllamaModelId(cur.model)
+
+  if (wantLocal) {
+    if (!curLocal) {
+      next.cloudBaseUrl = cur.baseUrl || DEFAULT_SETTINGS.cloudBaseUrl
+      const leavingKey = String(cur.apiKey || '').trim()
+      // Never stash the Ollama placeholder as the cloud key.
+      next.cloudApiKey = !isLocalPlaceholderKey(leavingKey)
+        ? leavingKey
+        : String(cur.cloudApiKey || '')
+    } else {
+      next.cloudBaseUrl = cur.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl
+      next.cloudApiKey = String(cur.cloudApiKey || '')
+    }
+    next.baseUrl = cur.localBaseUrl || LOCAL_OLLAMA_BASE_URL
+    next.apiKey = LOCAL_OLLAMA_API_KEY
+    next.localBaseUrl = next.baseUrl
+    next.localApiKey = LOCAL_OLLAMA_API_KEY
+  } else if (curLocal) {
+    const cloudKey = String(cur.cloudApiKey || '').trim()
+    next.baseUrl = cur.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl
+    next.apiKey = !isLocalPlaceholderKey(cloudKey)
+      ? cloudKey
+      : !isLocalPlaceholderKey(cur.apiKey)
+        ? String(cur.apiKey)
+        : ''
+    next.cloudBaseUrl = next.baseUrl
+    next.cloudApiKey = next.apiKey
+  }
+  return next
 }
 
 function ensureDirs() {
@@ -130,6 +220,10 @@ function writeSettings(next) {
         ? next.modelLastUsed
         : {}),
     },
+    cloudBaseUrl: next.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl,
+    cloudApiKey: next.cloudApiKey != null ? next.cloudApiKey : '',
+    localBaseUrl: next.localBaseUrl || LOCAL_OLLAMA_BASE_URL,
+    localApiKey: next.localApiKey || LOCAL_OLLAMA_API_KEY,
   }
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(merged, null, 2), 'utf8')
   return merged
@@ -325,6 +419,14 @@ app.get('/api/models', async (req, res) => {
     const catalog = await getModelsCatalog({
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey,
+      cloudBaseUrl: settings.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl,
+      cloudApiKey:
+        settings.cloudApiKey != null && String(settings.cloudApiKey).trim()
+          ? settings.cloudApiKey
+          : isLocalOllamaBaseUrl(settings.baseUrl)
+            ? ''
+            : settings.apiKey,
+      localBaseUrl: settings.localBaseUrl || LOCAL_OLLAMA_BASE_URL,
       dataDir: DATA_DIR,
       force,
     })
@@ -334,26 +436,126 @@ app.get('/api/models', async (req, res) => {
   }
 })
 
-app.get('/api/settings', (_req, res) => {
-  const s = readSettings()
-  const key = s.apiKey ? String(s.apiKey) : ''
-  const cli = resolveOpenClaudeCli(GUI_ROOT)
-  res.json({
-    baseUrl: s.baseUrl,
-    model: s.model,
-    cwd: s.cwd || '',
-    planMode: Boolean(s.planMode),
-    apiKey: key,
-    apiKeySet: Boolean(key.trim()),
-    apiKeyPreview: key
-      ? `${key.slice(0, 4)}…${key.slice(-4)}`
-      : '',
-    agentCli: cli?.label || null,
-    agentReady: Boolean(cli),
-  })
+/// <summary> AI Cursor </summary>
+function ollamaNativeBase(settings) {
+  let u = String(
+    settings?.localBaseUrl || settings?.baseUrl || LOCAL_OLLAMA_BASE_URL,
+  ).replace(/\/+$/, '')
+  u = u.replace(/\/v1$/i, '')
+  return u || 'http://127.0.0.1:11434'
+}
+
+/// <summary> AI Cursor </summary>
+async function listInstalledOllamaModelIds(base) {
+  const r = await fetch(`${base}/api/tags`)
+  if (!r.ok) throw new Error(`Ollama /api/tags HTTP ${r.status}`)
+  const json = await r.json()
+  const models = Array.isArray(json?.models) ? json.models : []
+  const ids = new Set()
+  for (const m of models) {
+    const name = String(m.name || m.model || '').trim()
+    if (!name) continue
+    ids.add(name)
+    // also accept bare tag without :latest
+    if (name.endsWith(':latest')) ids.add(name.slice(0, -':latest'.length))
+  }
+  return ids
+}
+
+/// <summary> AI Cursor </summary>
+function isOllamaModelInstalled(installed, modelId) {
+  const id = String(modelId || '').trim()
+  if (!id) return false
+  if (installed.has(id)) return true
+  if (installed.has(`${id}:latest`)) return true
+  // digest-style or alias match: compare case-insensitively
+  const lower = id.toLowerCase()
+  for (const x of installed) if (String(x).toLowerCase() === lower) return true
+  return false
+}
+
+/// <summary> AI Cursor </summary>
+function formatBytes(n) {
+  const v = Number(n) || 0
+  if (v <= 0) return ''
+  if (v < 1024) return `${v} B`
+  if (v < 1024 ** 2) return `${(v / 1024).toFixed(1)} KB`
+  if (v < 1024 ** 3) return `${(v / 1024 ** 2).toFixed(1)} MB`
+  return `${(v / 1024 ** 3).toFixed(2)} GB`
+}
+
+/// <summary> AI Cursor </summary>
+app.get('/api/ollama/loaded', async (_req, res) => {
+  const settings = readSettings()
+  const base = ollamaNativeBase(settings)
+  try {
+    const r = await fetch(`${base}/api/ps`)
+    if (!r.ok) throw new Error(`Ollama /api/ps HTTP ${r.status}`)
+    const json = await r.json()
+    const models = (Array.isArray(json?.models) ? json.models : []).map(m => {
+      const name = String(m.name || m.model || '')
+      const size = Number(m.size) || 0
+      const sizeVram = Number(m.size_vram) || 0
+      return {
+        name,
+        model: String(m.model || name),
+        size,
+        sizeVram,
+        sizeLabel: formatBytes(sizeVram || size),
+        details: m.details || null,
+        expiresAt: m.expires_at || null,
+      }
+    })
+    res.json({ ok: true, baseUrl: base, models })
+  } catch (err) {
+    res.status(502).json({
+      ok: false,
+      baseUrl: base,
+      models: [],
+      error: err?.message || String(err),
+    })
+  }
 })
 
-app.put('/api/settings', (req, res) => {
+/// <summary> AI Cursor </summary>
+app.post('/api/ollama/unload', async (req, res) => {
+  const settings = readSettings()
+  const base = ollamaNativeBase(settings)
+  const model = String(req.body?.model || '').trim()
+  if (!model) return res.status(400).json({ ok: false, error: 'model required' })
+  try {
+    const r = await fetch(`${base}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, keep_alive: 0 }),
+    })
+    const text = await r.text()
+    let json = null
+    try {
+      json = text ? JSON.parse(text) : null
+    } catch {
+      json = null
+    }
+    if (!r.ok)
+      throw new Error(
+        (json && (json.error || json.message)) ||
+          `Ollama unload HTTP ${r.status}: ${text.slice(0, 200)}`,
+      )
+    res.json({
+      ok: true,
+      model,
+      doneReason: json?.done_reason || null,
+    })
+  } catch (err) {
+    res.status(502).json({ ok: false, model, error: err?.message || String(err) })
+  }
+})
+
+app.get('/api/settings', (_req, res) => {
+  res.json(settingsPublic(readSettings()))
+})
+
+app.put('/api/settings', async (req, res) => {
   const cur = readSettings()
   const body = req.body || {}
   const next = {
@@ -362,30 +564,93 @@ app.put('/api/settings', (req, res) => {
     cwd: body.cwd != null ? String(body.cwd).trim() : cur.cwd || '',
     planMode:
       body.planMode != null ? Boolean(body.planMode) : Boolean(cur.planMode),
+    ollamaThink:
+      body.ollamaThink != null
+        ? Boolean(body.ollamaThink)
+        : Boolean(cur.ollamaThink),
     apiKey: cur.apiKey,
+    cloudBaseUrl: cur.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl,
+    cloudApiKey: cur.cloudApiKey != null ? cur.cloudApiKey : '',
+    localBaseUrl: cur.localBaseUrl || LOCAL_OLLAMA_BASE_URL,
+    localApiKey: cur.localApiKey || LOCAL_OLLAMA_API_KEY,
     modelLastUsed: { ...(cur.modelLastUsed || {}) },
+  }
+  if (body.model != null) {
+    const parsed = parseLocalModelSelection(next.model)
+    next.model = parsed.model
+    if (parsed.ollamaThink != null) next.ollamaThink = parsed.ollamaThink
   }
   if (typeof body.apiKey === 'string') {
     const key = body.apiKey.trim()
-    if (key && key !== '********') next.apiKey = key
+    if (key && key !== '********') {
+      // While on local Ollama, the settings field edits the remembered cloud key.
+      if (isLocalOllamaBaseUrl(next.baseUrl) || isLocalOllamaModelId(next.model)) {
+        if (!isLocalPlaceholderKey(key)) {
+          next.cloudApiKey = key
+          // Keep active runtime key as Ollama placeholder.
+          next.apiKey = LOCAL_OLLAMA_API_KEY
+          next.localApiKey = LOCAL_OLLAMA_API_KEY
+        }
+      } else {
+        next.apiKey = key
+        if (!isLocalPlaceholderKey(key)) next.cloudApiKey = key
+      }
+    }
   }
-  if (body.clearApiKey === true) next.apiKey = ''
+  if (body.clearApiKey === true) {
+    if (isLocalOllamaBaseUrl(next.baseUrl) || isLocalOllamaModelId(next.model)) {
+      next.cloudApiKey = ''
+      next.apiKey = LOCAL_OLLAMA_API_KEY
+    } else {
+      next.apiKey = ''
+      next.cloudApiKey = ''
+    }
+  }
+
+  // Switching model also switches endpoint (local Ollama <-> cloud).
+  if (body.model != null && String(body.model).trim() !== String(cur.model || ''))
+    applyModelEndpointSwitch(next, cur)
+  // Manual baseUrl edit while keeping model: if user points at Ollama, sync local fields.
+  else if (body.baseUrl != null && isLocalOllamaBaseUrl(next.baseUrl)) {
+    next.localBaseUrl = next.baseUrl
+    next.apiKey = LOCAL_OLLAMA_API_KEY
+    next.localApiKey = LOCAL_OLLAMA_API_KEY
+    if (!isLocalOllamaBaseUrl(cur.baseUrl)) {
+      next.cloudBaseUrl = cur.baseUrl
+      if (!isLocalPlaceholderKey(cur.apiKey))
+        next.cloudApiKey = String(cur.apiKey || '')
+    }
+  } else if (
+    body.baseUrl != null &&
+    !isLocalOllamaBaseUrl(next.baseUrl) &&
+    isLocalOllamaBaseUrl(cur.baseUrl)
+  ) {
+    next.cloudBaseUrl = next.baseUrl
+    if (!isLocalPlaceholderKey(next.apiKey)) next.cloudApiKey = next.apiKey
+    else if (!isLocalPlaceholderKey(cur.cloudApiKey))
+      next.apiKey = String(cur.cloudApiKey)
+  }
+
+  // Validate local model exists BEFORE persisting.
+  if (isLocalOllamaModelId(next.model) || isLocalOllamaBaseUrl(next.baseUrl)) {
+    try {
+      const base = ollamaNativeBase(next)
+      const installed = await listInstalledOllamaModelIds(base)
+      if (!isOllamaModelInstalled(installed, next.model)) {
+        const available = [...installed].sort().join(', ') || '(无)'
+        return res.status(400).json({
+          error: `本地模型「${next.model}」尚未安装。请先执行：ollama pull ${next.model}\n本机已有：${available}`,
+        })
+      }
+    } catch (err) {
+      return res.status(502).json({
+        error: `无法验证本地模型是否已安装：${err?.message || err}`,
+      })
+    }
+  }
+
   const saved = writeSettings(next)
-  const key = saved.apiKey ? String(saved.apiKey) : ''
-  const cli = resolveOpenClaudeCli(GUI_ROOT)
-  res.json({
-    baseUrl: saved.baseUrl,
-    model: saved.model,
-    cwd: saved.cwd || '',
-    planMode: Boolean(saved.planMode),
-    apiKey: key,
-    apiKeySet: Boolean(key.trim()),
-    apiKeyPreview: key
-      ? `${key.slice(0, 4)}…${key.slice(-4)}`
-      : '',
-    agentCli: cli?.label || null,
-    agentReady: Boolean(cli),
-  })
+  res.json(settingsPublic(saved))
 })
 
 app.get('/api/sessions', (_req, res) => {
@@ -480,6 +745,22 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: '请先在设置中填写 API Key' })
 
   const modelId = settings.model || DEFAULT_SETTINGS.model
+  if (isLocalOllamaModelId(modelId) || isLocalOllamaBaseUrl(settings.baseUrl)) {
+    try {
+      const base = ollamaNativeBase(settings)
+      const installed = await listInstalledOllamaModelIds(base)
+      if (!isOllamaModelInstalled(installed, modelId)) {
+        const available = [...installed].sort().join(', ') || '(无)'
+        return res.status(400).json({
+          error: `本地模型「${modelId}」尚未安装（Ollama 返回不存在）。请先：ollama pull ${modelId}\n或在右上角改选已安装模型。本机已有：${available}`,
+        })
+      }
+    } catch (err) {
+      return res.status(502).json({
+        error: `无法连接 Ollama 校验模型：${err?.message || err}`,
+      })
+    }
+  }
   touchModelLastUsed(modelId, settings)
 
   const displayText =
@@ -534,6 +815,7 @@ app.post('/api/chat', async (req, res) => {
     assistantText,
     usageLike,
     usageDetail = null,
+    thinkingText = null,
   ) {
     const promptTokens = Number(usageLike?.promptTokens ?? usageLike?.prompt_tokens) || 0
     const completionTokens =
@@ -566,6 +848,7 @@ app.post('/api/chat', async (req, res) => {
       content,
       createdAt: new Date().toISOString(),
       model: modelId,
+      ...(thinkingText ? { thinking: String(thinkingText) } : {}),
       usage: hasCounts
         ? {
             promptTokens,
@@ -599,6 +882,12 @@ app.post('/api/chat', async (req, res) => {
   send('user', userMsg)
   const assistantId = randomUUID()
   send('assistant_start', { id: assistantId })
+  send('status', {
+    id: assistantId,
+    text: /11434|ollama/i.test(String(settings.baseUrl || ''))
+      ? '正在准备本地 Agent 调用…'
+      : '正在准备 Agent 调用…',
+  })
 
   const baseUrl = normalizeBaseUrl(settings.baseUrl)
 
@@ -611,6 +900,7 @@ app.post('/api/chat', async (req, res) => {
     fs.mkdirSync(configDir, { recursive: true })
 
     let assistantText = ''
+    let assistantThinking = ''
     const ac = new AbortController()
     res.on('close', () => {
       try {
@@ -625,6 +915,7 @@ app.post('/api/chat', async (req, res) => {
       prompt: text,
       images,
       planMode: Boolean(settings.planMode),
+      ollamaThink: Boolean(settings.ollamaThink),
       cwd: workCwd,
       model: modelId,
       apiKey: settings.apiKey,
@@ -650,6 +941,11 @@ app.post('/api/chat', async (req, res) => {
           send('delta', { id: assistantId, text: line })
         } else if (ev.type === 'status' && ev.text) {
           send('status', { id: assistantId, text: ev.text })
+        } else if (ev.type === 'thinking' && ev.text) {
+          assistantThinking += ev.text
+          send('thinking', { id: assistantId, text: ev.text })
+        } else if (ev.type === 'thinking_done') {
+          send('thinking_done', { id: assistantId })
         }
       },
     })
@@ -662,6 +958,7 @@ app.post('/api/chat', async (req, res) => {
         result.text || assistantText,
         result.usage,
         result.usageDetail || null,
+        assistantThinking || null,
       )
   } catch (err) {
     console.error('[openclaude-gui] chat error:', err)

@@ -69,7 +69,7 @@ test('optional tool properties are not added to required[] — fixes Groq/Azure 
   expect(parameters.additionalProperties).toBe(false)
 })
 
-test('omits deferred tool search and promotes known Agent fields', () => {
+test('keeps ToolSearch for OpenAI client-side progressive disclosure', () => {
   const inputSchema = {
     type: 'object',
     properties: {
@@ -80,7 +80,15 @@ test('omits deferred tool search and promotes known Agent fields', () => {
     required: ['optional'],
   }
   const tools = convertTools([
-    { name: 'ToolSearchTool' },
+    {
+      name: 'ToolSearch',
+      description: 'Fetch deferred tool schemas',
+      input_schema: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+      },
+    },
     {
       name: 'Agent',
       input_schema: inputSchema,
@@ -90,9 +98,8 @@ test('omits deferred tool search and promotes known Agent fields', () => {
     disableStrictTools: false,
   })
 
-  expect(tools).toHaveLength(1)
-  expect(tools[0]?.function.name).toBe('Agent')
-  expect(tools[0]?.function.parameters.required).toEqual([
+  expect(tools.map(t => t.function.name)).toEqual(['ToolSearch', 'Agent'])
+  expect(tools[1]?.function.parameters.required).toEqual([
     'optional',
     'message',
     'subagent_type',

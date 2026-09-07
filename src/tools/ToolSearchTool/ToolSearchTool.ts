@@ -17,13 +17,17 @@ import { lazySchema } from '../../utils/lazySchema.js'
 import { escapeRegExp } from '../../utils/stringUtils.js'
 import { isToolSearchEnabledOptimistic } from '../../utils/toolSearch.js'
 import { getPrompt, isDeferredTool, TOOL_SEARCH_TOOL_NAME } from './prompt.js'
+import { isClientSideToolSearchOrchestration } from '../../utils/toolSearch.js'
+import { isToolDescriptionStubEnabled } from '../../utils/toolDescriptionStub.js'
+import { jsonStringify } from '../../utils/slowOperations.js'
+import { zodToJsonSchema } from '../../utils/zodToJsonSchema.js'
 
 export const inputSchema = lazySchema(() =>
   z.object({
     query: z
       .string()
       .describe(
-        'Query to find deferred tools. Use "select:<tool_name>" for direct selection, or keywords to search.',
+        'Query to find tools. Use "select:<tool_name>" for direct selection, or keywords to search. Fetches deferred tools onto the tools list, and returns full usage docs for tools that only show a short [d] stub.',
       ),
     max_results: z
       .number()
@@ -40,6 +44,16 @@ export const outputSchema = lazySchema(() =>
     query: z.string(),
     total_deferred_tools: z.number(),
     pending_mcp_servers: z.array(z.string()).optional(),
+    /** AI Cursor — client-side ToolSearch embeds schemas for OpenAI shims */
+    function_definitions: z
+      .array(
+        z.object({
+          name: z.string(),
+          description: z.string(),
+          parameters: z.record(z.string(), z.unknown()),
+        }),
+      )
+      .optional(),
   }),
 )
 type OutputSchema = ReturnType<typeof outputSchema>
@@ -112,6 +126,7 @@ function buildSearchResult(
   query: string,
   totalDeferredTools: number,
   pendingMcpServers?: string[],
+  functionDefinitions?: Output['function_definitions'],
 ): { data: Output } {
   return {
     data: {
@@ -121,8 +136,52 @@ function buildSearchResult(
       ...(pendingMcpServers && pendingMcpServers.length > 0
         ? { pending_mcp_servers: pendingMcpServers }
         : {}),
+      ...(functionDefinitions && functionDefinitions.length > 0
+        ? { function_definitions: functionDefinitions }
+        : {}),
     },
   }
+}
+
+/**
+ * AI Cursor
+ * Build <functions> payloads for providers that do not expand tool_reference.
+ */
+async function buildFunctionDefinitions(
+  matchNames: string[],
+  tools: Tools,
+): Promise<NonNullable<Output['function_definitions']>> {
+  const defs: NonNullable<Output['function_definitions']> = []
+  for (const name of matchNames) {
+    const tool = findToolByName(tools, name)
+    if (!tool) continue
+    let description = ''
+    try {
+      description = await tool.prompt({
+        getToolPermissionContext: async () => ({
+          mode: 'default' as const,
+          additionalWorkingDirectories: new Map(),
+          alwaysAllowRules: {},
+          alwaysDenyRules: {},
+          alwaysAskRules: {},
+          isBypassPermissionsModeAvailable: false,
+        }),
+        tools,
+        agents: [],
+      })
+    } catch {
+      description = tool.name
+    }
+    // Cap verbose tool prompts so search results stay usable on small-context models
+    if (description.length > 2000) description = `${description.slice(0, 2000)}…`
+    const parameters = (
+      'inputJSONSchema' in tool && tool.inputJSONSchema
+        ? tool.inputJSONSchema
+        : zodToJsonSchema(tool.inputSchema)
+    ) as Record<string, unknown>
+    defs.push({ name: tool.name, description, parameters })
+  }
+  return defs
 }
 
 /**
@@ -329,6 +388,11 @@ export const ToolSearchTool = buildTool({
     const { query, max_results = 5 } = input
 
     const deferredTools = tools.filter(isDeferredTool)
+    // AI Cursor — when descriptions are stubbed, also search always-loaded
+    // tools so select:Bash / keyword queries can fetch full prompts.
+    const searchableTools = isToolDescriptionStubEnabled()
+      ? tools.filter(t => t.name !== TOOL_SEARCH_TOOL_NAME)
+      : deferredTools
     maybeInvalidateCache(deferredTools)
 
     // Check for MCP servers still connecting
@@ -355,6 +419,24 @@ export const ToolSearchTool = buildTool({
       })
     }
 
+    /** AI Cursor — finalize with optional client-side schemas */
+    async function finalizeResult(
+      matches: string[],
+      pendingMcpServers?: string[],
+    ): Promise<{ data: Output }> {
+      const functionDefinitions =
+        matches.length > 0 && isClientSideToolSearchOrchestration()
+          ? await buildFunctionDefinitions(matches, tools)
+          : undefined
+      return buildSearchResult(
+        matches,
+        query,
+        deferredTools.length,
+        pendingMcpServers,
+        functionDefinitions,
+      )
+    }
+
     // Check for select: prefix — direct tool selection.
     // Supports comma-separated multi-select: `select:A,B,C`.
     // If a name isn't in the deferred set but IS in the full tool set,
@@ -371,6 +453,7 @@ export const ToolSearchTool = buildTool({
       const missing: string[] = []
       for (const toolName of requested) {
         const tool =
+          findToolByName(searchableTools, toolName) ??
           findToolByName(deferredTools, toolName) ??
           findToolByName(tools, toolName)
         if (tool) {
@@ -386,12 +469,7 @@ export const ToolSearchTool = buildTool({
         )
         logSearchOutcome([], 'select')
         const pendingServers = getPendingServerNames()
-        return buildSearchResult(
-          [],
-          query,
-          deferredTools.length,
-          pendingServers,
-        )
+        return finalizeResult([], pendingServers)
       }
 
       if (missing.length > 0) {
@@ -402,13 +480,13 @@ export const ToolSearchTool = buildTool({
         logForDebugging(`ToolSearchTool: selected ${found.join(', ')}`)
       }
       logSearchOutcome(found, 'select')
-      return buildSearchResult(found, query, deferredTools.length)
+      return finalizeResult(found)
     }
 
     // Keyword search
     const matches = await searchToolsWithKeywords(
       query,
-      deferredTools,
+      searchableTools,
       tools,
       max_results,
     )
@@ -422,15 +500,10 @@ export const ToolSearchTool = buildTool({
     // Include pending server info when search finds no matches
     if (matches.length === 0) {
       const pendingServers = getPendingServerNames()
-      return buildSearchResult(
-        matches,
-        query,
-        deferredTools.length,
-        pendingServers,
-      )
+      return finalizeResult(matches, pendingServers)
     }
 
-    return buildSearchResult(matches, query, deferredTools.length)
+    return finalizeResult(matches)
   },
   renderToolUseMessage() {
     return null
@@ -440,6 +513,8 @@ export const ToolSearchTool = buildTool({
    * Returns a tool_result with tool_reference blocks.
    * This format works on 1P/Foundry. Bedrock/Vertex may not support
    * client-side tool_reference expansion yet.
+   * AI Cursor: on OpenAI-compatible wires, also embed <functions> schemas
+   * so the model can call discovered tools without server expansion.
    */
   mapToolResultToToolResultBlockParam(
     content: Output,
@@ -459,13 +534,47 @@ export const ToolSearchTool = buildTool({
         content: text,
       }
     }
+
+    const references = content.matches.map(name => ({
+      type: 'tool_reference' as const,
+      tool_name: name,
+    }))
+
+    if (
+      isClientSideToolSearchOrchestration() &&
+      content.function_definitions &&
+      content.function_definitions.length > 0
+    ) {
+      const functionsBlock = [
+        '<functions>',
+        ...content.function_definitions.map(
+          def =>
+            `<function>${jsonStringify({
+              description: def.description,
+              name: def.name,
+              parameters: def.parameters,
+            })}</function>`,
+        ),
+        '</functions>',
+        '',
+        'These tools are now loaded. They will also appear in your tools list on the next turn — call them with the schemas above.',
+      ].join('\n')
+      // Mixed text + tool_reference is OK on converted wires (OpenAI shim).
+      // Do NOT use this shape on Anthropic wire — server rejects the mix.
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseID,
+        content: [
+          { type: 'text' as const, text: functionsBlock },
+          ...references,
+        ],
+      } as unknown as ToolResultBlockParam
+    }
+
     return {
       type: 'tool_result',
       tool_use_id: toolUseID,
-      content: content.matches.map(name => ({
-        type: 'tool_reference' as const,
-        tool_name: name,
-      })),
+      content: references,
     } as unknown as ToolResultBlockParam
   },
 } satisfies ToolDef<InputSchema, Output>)

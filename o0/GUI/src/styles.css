@@ -222,6 +222,117 @@ button {
   word-break: break-word;
 }
 
+.msg-thinking {
+  margin: 0 0 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.msg-thinking > summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 0.4rem 0.65rem;
+  color: var(--text);
+  font-weight: 500;
+  list-style: none;
+}
+
+.msg-thinking > summary::-webkit-details-marker {
+  display: none;
+}
+
+.msg-thinking > summary::before {
+  content: '▸ ';
+  color: var(--muted);
+}
+
+.msg-thinking[open] > summary::before {
+  content: '▾ ';
+}
+
+.msg-thinking-body {
+  padding: 0 0.65rem 0.55rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 14rem;
+  overflow: auto;
+  line-height: 1.45;
+  border-top: 1px solid var(--border);
+  margin-top: 0;
+  padding-top: 0.45rem;
+}
+
+.stream-waiting {
+  color: var(--muted);
+}
+
+.stream-progress {
+  margin-top: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(61, 156, 240, 0.06);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.stream-progress-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.stream-progress-status {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.stream-elapsed {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.stream-timing {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.15rem;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+  line-height: 1.25;
+}
+
+.stream-eta {
+  color: var(--accent);
+  opacity: 0.95;
+}
+
+.stream-steps {
+  margin: 0.45rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 9rem;
+  overflow: auto;
+}
+
+.stream-step {
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.stream-step.tool {
+  color: var(--accent);
+}
+
 .msg-cost {
   margin-top: 0.65rem;
   padding-top: 0.5rem;
@@ -680,6 +791,17 @@ button {
   background: var(--accent-dim);
 }
 
+.model-row.disabled,
+.model-row:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.model-row.disabled:hover,
+.model-row:disabled:hover {
+  background: transparent;
+}
+
 .model-row-main {
   display: flex;
   flex-wrap: wrap;
@@ -689,8 +811,8 @@ button {
 }
 
 .model-id {
-  font-family: var(--mono);
-  font-size: 0.88rem;
+  font-family: var(--font);
+  font-size: 0.9rem;
   font-weight: 600;
   flex: 1 1 12rem;
   min-width: 0;
@@ -698,6 +820,11 @@ button {
   word-break: break-word;
   white-space: normal;
   line-height: 1.35;
+}
+
+.model-ollama-id {
+  font-family: var(--mono);
+  opacity: 0.85;
 }
 
 .model-price {
@@ -733,6 +860,40 @@ button {
   padding: 1.5rem;
   color: var(--muted);
   text-align: center;
+}
+
+.ollama-vram-panel .ollama-vram-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: min(60vh, 420px);
+  overflow: auto;
+  padding: 0.25rem 0 0.5rem;
+}
+
+.ollama-vram-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.ollama-vram-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.ollama-vram-main .model-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .overlay {

@@ -44,6 +44,10 @@ import { createCombinedAbortSignal } from './combinedAbortSignal.js'
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
+import {
+  formatStubToolDescription,
+  shouldStubToolDescription,
+} from './toolDescriptionStub.js'
 import { createUserMessage } from './messages.js'
 import { isAnthropicBillingAttributionBlock } from './anthropicAttribution.js'
 import {
@@ -272,9 +276,17 @@ export async function toolToAPISchema(
   // (tool search defers different tools per turn; cache markers move).
   // Explicit field copy avoids mutating the cached base and sidesteps
   // BetaTool.cache_control's `| null` clashing with our narrower type.
+  //
+  // AI Cursor — OpenAI-compatible wires: stub long descriptions after cache
+  // so schema bytes stay full for ToolSearch, while the request tools array
+  // ships `[d]` stubs (parameters preserved).
+  const description = shouldStubToolDescription(tool)
+    ? formatStubToolDescription(tool, base.description)
+    : base.description
+
   const schema: BetaToolWithExtras = {
     name: base.name,
-    description: base.description,
+    description,
     input_schema: base.input_schema,
     ...(base.strict && { strict: true }),
     ...(base.eager_input_streaming && { eager_input_streaming: true }),
