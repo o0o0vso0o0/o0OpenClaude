@@ -1,0 +1,24 @@
+# AI Cursor — OpenClaude local SearXNG (JSON API enabled)
+use_default_settings: true
+
+general:
+  instance_name: "OpenClaude SearXNG"
+  enable_metrics: false
+
+server:
+  # Overridden by container env when present; keep a local default for non-Docker runs.
+  secret_key: "openclaude-local-searxng-change-me"
+  limiter: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

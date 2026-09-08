@@ -13,13 +13,18 @@ import {
   categorizeToolName,
   emptyToolCounts,
   extractFileChangeFromToolResult,
+  extractWebPages,
   formatCommandsSummary,
   formatEditedSummary,
   formatExploredSummary,
-  formatThoughtFor,
+  formatThoughtForZh,
+  formatToolPreview,
   formatWorkedFor,
+  buildPromptRecord,
+  inputLooksReady,
   toolInputFilePath,
 } from './agent-activity.mjs'
+import { applyLocalSearxngEnv } from './websearch-env.mjs'
 
 /// <summary> AI Cursor </summary>
 export function resolveOpenClaudeCli(guiRoot) {
@@ -110,20 +115,6 @@ function buildControlResponse(requestId, result) {
 }
 
 /// <summary> AI Cursor </summary>
-function toolPreview(input) {
-  if (!input || typeof input !== 'object') return String(input ?? '')
-  if (input.command) return String(input.command)
-  if (input.file_path || input.path) return String(input.file_path || input.path)
-  if (input.query) return String(input.query)
-  try {
-    const s = JSON.stringify(input)
-    return s.length > 160 ? `${s.slice(0, 160)}…` : s
-  } catch {
-    return String(input)
-  }
-}
-
-/// <summary> AI Cursor </summary>
 export function findSessionJsonl(configDir, sessionId) {
   const id = String(sessionId || '').trim()
   const root = String(configDir || '').trim()
@@ -177,6 +168,8 @@ function runAgentTurnOnce(opts) {
     model,
     apiKey,
     baseUrl,
+    tavilyApiKey = '',
+    webSearchBackend = '',
     resumeSessionId = null,
     configDir = null,
     maxTurns = 50,
@@ -214,6 +207,17 @@ function runAgentTurnOnce(opts) {
     String(maxTurns || 50),
   ]
   if (!planMode) args.push('--dangerously-skip-permissions')
+  // Prefer WebSearch for discovery; never scrape SERP pages with WebFetch.
+  args.push(
+    '--append-system-prompt',
+    [
+      'Web lookup rules:',
+      '1) To search the internet, call WebSearch with parameter query (a non-empty string).',
+      '2) Never WebFetch Google/Bing/DuckDuckGo/Baidu/Yahoo search result URLs — they timeout or block.',
+      '3) After WebSearch, WebFetch only concrete content URLs (articles, store pages, wikis).',
+      '4) Do not invent prices or URLs; cite Sources from tool results.',
+    ].join(' '),
+  )
 
   // Prefer absolute .jsonl path so resume works across cwd/project-dir mismatches.
   const resumeId = resumeSessionId ? String(resumeSessionId).trim() : ''
@@ -227,8 +231,11 @@ function runAgentTurnOnce(opts) {
     OPENAI_API_KEY: String(apiKey || ''),
     OPENAI_BASE_URL: String(baseUrl || '').replace(/\/+$/, ''),
     OPENAI_MODEL: String(model || ''),
+    // Full tool.prompt() text on OpenAI/Ollama — do not shrink to [d] stubs.
+    CLAUDE_CODE_TOOL_DESC_STUB: 'false',
   }
   env.OPENCLAUDE_OLLAMA_THINK = ollamaThink ? '1' : '0'
+  applyLocalSearxngEnv(env, guiRoot, { tavilyApiKey, webSearchBackend })
   if (configDir) {
     env.OPENCLAUDE_CONFIG_DIR = configDir
     env.CLAUDE_CONFIG_DIR = configDir
@@ -254,11 +261,27 @@ function runAgentTurnOnce(opts) {
     const turnStartedAt = Date.now()
     let thinkingStartedAt = 0
     let thinkingMs = 0
+    /** @type {Array<{ kind: 'thought'|'reply'|'tool', id: string, text?: string, ms?: number, label?: string, active?: boolean, toolId?: string, name?: string, preview?: string, input?: object }>} */
+    const segments = []
+    /** @type {{ kind: 'thought', id: string, text: string, startedAt: number, active: boolean, ms?: number, label?: string } | null} */
+    let currentThought = null
+    /** @type {{ kind: 'reply', id: string, text: string } | null} */
+    let currentReply = null
     const toolCounts = emptyToolCounts()
     /** @type {Map<string, { filePath: string, added: number, removed: number }>} */
     const filesChangedMap = new Map()
-    /** @type {Map<string, { name: string, input: object }>} */
+    /** @type {Set<string>} */
+    const filesReadSet = new Set()
+    /** @type {Map<string, { title: string, url: string, source?: string }>} */
+    const webPagesMap = new Map()
+    /** @type {Array<{ toolId: string, name: string, input: object, preview: string, ready: boolean, segmentId: string }>} */
+    const toolsUsed = []
+    /** @type {Map<string, { name: string, input: object, segmentId: string, ready: boolean, counted: boolean }>} */
     const pendingTools = new Map()
+    /** @type {{ toolId: string, name: string, json: string, segmentId: string } | null} */
+    let streamingTool = null
+    let inToolBlock = false
+    const userPromptText = String(prompt || '')
 
     /// <summary> AI Cursor </summary>
     function filesChangedList() {
@@ -286,56 +309,298 @@ function runAgentTurnOnce(opts) {
     }
 
     /// <summary> AI Cursor </summary>
-    function noteThinkingStart() {
-      if (!thinkingStartedAt) thinkingStartedAt = Date.now()
+    function ensureThoughtSegment() {
+      if (currentThought) return currentThought
+      if (currentReply) currentReply = null
+      const startedAt = Date.now()
+      currentThought = {
+        kind: 'thought',
+        id: randomUUID(),
+        text: '',
+        startedAt,
+        active: true,
+        label: '思考中…',
+      }
+      segments.push(currentThought)
+      thinkingStartedAt = startedAt
       inThinkingBlock = true
+      return currentThought
+    }
+
+    /// <summary> AI Cursor </summary>
+    function appendThoughtChunk(chunk) {
+      const seg = ensureThoughtSegment()
+      seg.text += chunk
+      onEvent({
+        type: 'thinking',
+        segmentId: seg.id,
+        text: String(chunk),
+      })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function noteThinkingStart() {
+      ensureThoughtSegment()
     }
 
     /// <summary> AI Cursor </summary>
     function noteThinkingDone() {
-      if (!inThinkingBlock && !thinkingStartedAt) return
-      if (thinkingStartedAt) {
-        thinkingMs += Math.max(0, Date.now() - thinkingStartedAt)
-        thinkingStartedAt = 0
-      }
+      if (!inThinkingBlock && !currentThought && !thinkingStartedAt) return
+      const seg = currentThought
+      const blockMs = seg
+        ? Math.max(0, Date.now() - seg.startedAt)
+        : thinkingStartedAt
+          ? Math.max(0, Date.now() - thinkingStartedAt)
+          : 0
+      thinkingMs += blockMs
+      thinkingStartedAt = 0
       inThinkingBlock = false
-      onEvent({ type: 'thinking_done' })
-      if (thinkingMs > 0)
+      const label = formatThoughtForZh(blockMs)
+      if (seg) {
+        seg.ms = blockMs
+        seg.label = label
+        seg.active = false
         onEvent({
-          type: 'activity',
-          kind: 'thought',
-          text: formatThoughtFor(thinkingMs),
-          active: false,
+          type: 'thinking_done',
+          segmentId: seg.id,
+          ms: blockMs,
+          label,
+          text: seg.text,
         })
+      } else {
+        onEvent({
+          type: 'thinking_done',
+          ms: blockMs,
+          label,
+        })
+      }
+      currentThought = null
+    }
+
+    /// <summary> AI Cursor </summary>
+    function appendReplyChunk(text) {
+      if (currentThought || inThinkingBlock) noteThinkingDone()
+      if (!currentReply) {
+        currentReply = { kind: 'reply', id: randomUUID(), text: '' }
+        segments.push(currentReply)
+      }
+      currentReply.text += text
+      onEvent({
+        type: 'delta',
+        segmentId: currentReply.id,
+        text,
+      })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function webPagesList() {
+      return [...webPagesMap.values()]
+    }
+
+    /// <summary> AI Cursor </summary>
+    function toolsUsedList() {
+      return toolsUsed.map(t => ({
+        toolId: t.toolId,
+        name: t.name,
+        preview: t.preview,
+        input: t.input && typeof t.input === 'object' ? t.input : {},
+        ready: Boolean(t.ready),
+      }))
+    }
+
+    /// <summary> AI Cursor </summary>
+    function upsertWebPages(pages) {
+      if (!Array.isArray(pages) || !pages.length) return
+      for (const p of pages) {
+        if (!p?.url) continue
+        webPagesMap.set(p.url, {
+          title: p.title || p.url,
+          url: p.url,
+          ...(p.source ? { source: p.source } : {}),
+        })
+      }
+      onEvent({ type: 'web_pages', pages: webPagesList() })
+    }
+
+    /// <summary> AI Cursor </summary>
+    function emitToolSegment(toolId, name, preview, input, ready) {
+      const existing = toolsUsed.find(t => t.toolId === toolId)
+      const segmentId = existing?.segmentId || randomUUID()
+      const previewText = preview || formatToolPreview(input) || ''
+      if (!existing) {
+        if (currentThought || inThinkingBlock) noteThinkingDone()
+        currentReply = null
+        const seg = {
+          kind: 'tool',
+          id: segmentId,
+          toolId,
+          name: name || 'Tool',
+          preview: previewText,
+          input: input && typeof input === 'object' ? input : {},
+          active: !ready,
+        }
+        segments.push(seg)
+        toolsUsed.push({
+          toolId,
+          name: name || 'Tool',
+          input: seg.input,
+          preview: previewText,
+          ready: Boolean(ready),
+          segmentId,
+        })
+      } else {
+        existing.name = name || existing.name
+        existing.input = input && typeof input === 'object' ? input : existing.input
+        existing.preview = previewText || existing.preview
+        existing.ready = Boolean(ready)
+        const seg = segments.find(s => s.id === existing.segmentId)
+        if (seg && seg.kind === 'tool') {
+          seg.name = existing.name
+          seg.preview = existing.preview
+          seg.input = existing.input
+          seg.active = !ready
+        }
+      }
+      onEvent({
+        type: ready ? 'tool_update' : 'tool',
+        id: toolId,
+        name: name || 'Tool',
+        preview: previewText,
+        input: input && typeof input === 'object' ? input : {},
+        segmentId,
+        ready: Boolean(ready),
+      })
+      if (ready) {
+        const line = `\n[tool] ${name || 'Tool'}${previewText ? ` · ${previewText}` : ''}\n`
+        // Avoid duplicating empty then full lines in assistantText
+        if (!assistantText.includes(`[tool] ${name || 'Tool'} · ${previewText}`)) {
+          if (previewText || !assistantText.includes(`[tool] ${name || 'Tool'}\n`))
+            assistantText += line
+        }
+      }
+    }
+
+    /// <summary> AI Cursor </summary>
+    function commitToolInput(toolId, name, input, { count = true } = {}) {
+      const inp = input && typeof input === 'object' ? input : {}
+      const ready = inputLooksReady(inp)
+      const preview = formatToolPreview(inp)
+      let pending = pendingTools.get(toolId)
+      if (!pending) {
+        pending = {
+          name: name || 'Tool',
+          input: inp,
+          segmentId: randomUUID(),
+          ready: false,
+          counted: false,
+        }
+        pendingTools.set(toolId, pending)
+      } else {
+        pending.name = name || pending.name
+        if (ready) pending.input = inp
+        else if (!inputLooksReady(pending.input)) pending.input = inp
+      }
+      if (count && !pending.counted) {
+        const cat = categorizeToolName(pending.name)
+        if (cat in toolCounts) toolCounts[cat] += 1
+        pending.counted = true
+        const fileHint = toolInputFilePath(pending.input)
+        if (cat === 'writes' && fileHint && !filesChangedMap.has(fileHint))
+          filesChangedMap.set(fileHint, {
+            filePath: fileHint,
+            added: 0,
+            removed: 0,
+          })
+        if (cat === 'reads' && fileHint) filesReadSet.add(fileHint)
+        emitActivitySummaries({ active: true })
+      }
+      pending.ready = ready || pending.ready
+      emitToolSegment(
+        toolId,
+        pending.name,
+        preview,
+        pending.input,
+        pending.ready,
+      )
+      if (ready) {
+        const pages = extractWebPages(null, pending.name, pending.input)
+        if (pages) upsertWebPages(pages)
+      }
+    }
+
+    /// <summary> AI Cursor </summary>
+    function beginToolUse(id, name, input) {
+      const toolId = id || `${name}-${seenTools.size}`
+      if (streamingTool && streamingTool.toolId !== toolId)
+        finalizeStreamingTool()
+      seenTools.add(toolId)
+      const inp = input && typeof input === 'object' ? input : {}
+      streamingTool = {
+        toolId,
+        name: name || 'Tool',
+        json: inputLooksReady(inp) ? JSON.stringify(inp) : '',
+        segmentId: randomUUID(),
+      }
+      inToolBlock = true
+      commitToolInput(toolId, name || 'Tool', inp, { count: true })
+      if (inputLooksReady(inp)) {
+        // Input already complete (some shims send full object at start)
+        streamingTool = null
+        inToolBlock = false
+      }
+    }
+
+    /// <summary> AI Cursor </summary>
+    function appendToolJsonDelta(partial) {
+      if (!streamingTool || !partial) return
+      streamingTool.json += String(partial)
+    }
+
+    /// <summary> AI Cursor </summary>
+    function finalizeStreamingTool() {
+      if (!streamingTool) {
+        inToolBlock = false
+        return
+      }
+      let input = {}
+      const raw = streamingTool.json.trim()
+      if (raw) {
+        try {
+          input = JSON.parse(raw)
+        } catch {
+          input = {}
+        }
+      }
+      commitToolInput(streamingTool.toolId, streamingTool.name, input, {
+        count: false,
+      })
+      streamingTool = null
+      inToolBlock = false
     }
 
     /// <summary> AI Cursor </summary>
     function registerToolUse(id, name, input) {
       const toolId = id || `${name}-${seenTools.size}`
-      if (seenTools.has(toolId)) return
-      seenTools.add(toolId)
       const inp = input && typeof input === 'object' ? input : {}
-      pendingTools.set(toolId, { name: name || 'Tool', input: inp })
-      const cat = categorizeToolName(name)
-      if (cat in toolCounts) toolCounts[cat] += 1
-      const fileHint = toolInputFilePath(inp)
-      if (cat === 'writes' && fileHint && !filesChangedMap.has(fileHint))
-        filesChangedMap.set(fileHint, {
-          filePath: fileHint,
-          added: 0,
-          removed: 0,
-        })
-      onEvent({
-        type: 'tool',
-        id: toolId,
-        name: name || 'Tool',
-        preview: toolPreview(inp),
-      })
-      emitActivitySummaries({ active: true })
+      if (pendingTools.has(toolId)) {
+        if (inputLooksReady(inp))
+          commitToolInput(toolId, name || 'Tool', inp, { count: false })
+        return
+      }
+      beginToolUse(toolId, name || 'Tool', inp)
+      if (inputLooksReady(inp)) {
+        streamingTool = null
+        inToolBlock = false
+      }
     }
 
     /// <summary> AI Cursor </summary>
     function ingestToolResultPayload(payload, toolUseId) {
+      const pending = toolUseId ? pendingTools.get(toolUseId) : null
+      const toolName = pending?.name || ''
+      const pages = extractWebPages(payload, toolName, pending?.input || null)
+      if (pages) upsertWebPages(pages)
+
       const change = extractFileChangeFromToolResult(payload)
       if (change) {
         const prev = filesChangedMap.get(change.filePath)
@@ -347,8 +612,14 @@ function runAgentTurnOnce(opts) {
         onEvent({ type: 'files_changed', files: filesChangedList() })
         return
       }
-      if (!toolUseId || !pendingTools.has(toolUseId)) return
-      const pending = pendingTools.get(toolUseId)
+      if (!toolUseId || !pending) return
+      if (categorizeToolName(pending.name) === 'reads') {
+        const fp = toolInputFilePath(pending.input)
+        if (fp) {
+          filesReadSet.add(fp)
+          onEvent({ type: 'files_read', files: [...filesReadSet] })
+        }
+      }
       if (categorizeToolName(pending.name) !== 'writes') return
       const fp = toolInputFilePath(pending.input)
       if (fp && !filesChangedMap.has(fp))
@@ -568,18 +839,12 @@ function runAgentTurnOnce(opts) {
             ? resultMsg.total_cost_usd
             : null,
         ...(() => {
-          if (thinkingStartedAt) {
-            thinkingMs += Math.max(0, Date.now() - thinkingStartedAt)
-            thinkingStartedAt = 0
-          }
+          if (currentThought || inThinkingBlock || thinkingStartedAt)
+            noteThinkingDone()
+          if (streamingTool || inToolBlock) finalizeStreamingTool()
+          currentReply = null
           const workedMs = Math.max(0, Date.now() - turnStartedAt)
           const items = []
-          if (thinkingMs > 0)
-            items.push({
-              kind: 'thought',
-              text: formatThoughtFor(thinkingMs),
-              active: false,
-            })
           const explored = formatExploredSummary(toolCounts, { active: false })
           if (explored)
             items.push({ kind: 'explored', text: explored, active: false })
@@ -604,9 +869,52 @@ function runAgentTurnOnce(opts) {
             ms: workedMs,
           })
           emitActivitySummaries({ active: false })
+          const tools = toolsUsedList()
+          const webPages = webPagesList()
+          const filesRead = [...filesReadSet]
+          const filesChanged = filesChangedList()
+          const promptRecord = buildPromptRecord({
+            userPrompt: userPromptText,
+            tools,
+            webPages,
+            filesChanged,
+            filesRead,
+          })
+          const segmentSnapshot = segments.map(s => {
+            if (s.kind === 'thought')
+              return {
+                kind: 'thought',
+                id: s.id,
+                text: s.text || '',
+                ms: typeof s.ms === 'number' ? s.ms : 0,
+                label: s.label || formatThoughtForZh(s.ms || 0),
+                active: false,
+              }
+            if (s.kind === 'tool')
+              return {
+                kind: 'tool',
+                id: s.id,
+                toolId: s.toolId,
+                name: s.name || 'Tool',
+                preview: s.preview || '',
+                input: s.input && typeof s.input === 'object' ? s.input : {},
+                active: false,
+              }
+            return {
+              kind: 'reply',
+              id: s.id,
+              text: s.text || '',
+            }
+          })
           return {
             activity: items,
-            filesChanged: filesChangedList(),
+            segments: segmentSnapshot,
+            tools,
+            webPages,
+            filesRead,
+            filesChanged,
+            promptRecord,
+            userPrompt: userPromptText,
             workedMs,
             thinkingMs,
           }
@@ -664,18 +972,12 @@ function runAgentTurnOnce(opts) {
             ''
           if (chunk) {
             noteThinkingStart()
-            onEvent({ type: 'thinking', text: String(chunk) })
+            appendThoughtChunk(String(chunk))
           }
           const now = Date.now()
           if (now - lastThinkingStatusAt > 1500) {
             lastThinkingStatusAt = now
             onEvent({ type: 'status', text: '正在思考…' })
-            onEvent({
-              type: 'activity',
-              kind: 'thought',
-              text: 'Thinking…',
-              active: true,
-            })
           }
         }
         if (
@@ -685,23 +987,26 @@ function runAgentTurnOnce(opts) {
         ) {
           noteThinkingStart()
           onEvent({ type: 'status', text: '正在思考…' })
-          onEvent({
-            type: 'activity',
-            kind: 'thought',
-            text: 'Thinking…',
-            active: true,
-          })
         }
         if (ev.type === 'content_block_stop' && inThinkingBlock)
           noteThinkingDone()
+        if (ev.type === 'content_block_stop' && inToolBlock)
+          finalizeStreamingTool()
+        if (
+          ev.type === 'content_block_delta' &&
+          ev.delta?.type === 'input_json_delta' &&
+          ev.delta.partial_json
+        )
+          appendToolJsonDelta(ev.delta.partial_json)
         if (
           ev.type === 'content_block_delta' &&
           ev.delta?.type === 'text_delta' &&
           ev.delta.text
         ) {
           if (inThinkingBlock) noteThinkingDone()
+          if (inToolBlock) finalizeStreamingTool()
           assistantText += ev.delta.text
-          onEvent({ type: 'delta', text: ev.delta.text })
+          appendReplyChunk(ev.delta.text)
         }
         if (
           ev.type === 'content_block_start' &&
@@ -709,7 +1014,7 @@ function runAgentTurnOnce(opts) {
         ) {
           if (inThinkingBlock) noteThinkingDone()
           const tu = ev.content_block
-          registerToolUse(tu.id, tu.name || 'Tool', tu.input)
+          beginToolUse(tu.id, tu.name || 'Tool', tu.input)
         }
         if (ev.type === 'message_start')
           onEvent({ type: 'status', text: '正在写回复…' })
@@ -735,7 +1040,7 @@ function runAgentTurnOnce(opts) {
               .join('')
             if (text) {
               assistantText = text
-              onEvent({ type: 'delta', text })
+              appendReplyChunk(text)
             }
           }
         }
@@ -758,7 +1063,7 @@ function runAgentTurnOnce(opts) {
           msg.result
         ) {
           assistantText = msg.result
-          onEvent({ type: 'delta', text: msg.result })
+          appendReplyChunk(msg.result)
         }
         onEvent({ type: 'status', text: '正在整理用量…' })
         void requestContextUsage().finally(() => {

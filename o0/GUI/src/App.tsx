@@ -16,7 +16,10 @@ import {
   SessionStatus,
   SessionSummary,
   SettingsPublic,
+  ToolCallItem,
+  TurnSegment,
   UsageDetail,
+  WebPageItem,
   createSession,
   discardSession,
   deleteSessionPermanent,
@@ -33,6 +36,7 @@ import {
 import ModelPicker from './ModelPicker'
 import OllamaVramPanel from './OllamaVramPanel'
 import UsageDetailModal from './UsageDetailModal'
+import TurnDetailsModal from './TurnDetailsModal'
 import { localModelLabel } from './localModelLabel'
 import {
   classifyStreamPhase,
@@ -69,6 +73,139 @@ function upsertActivity(
     const bi = ACTIVITY_KIND_ORDER.indexOf(String(b.kind))
     return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi)
   })
+}
+
+/// <summary> AI Cursor </summary>
+function newSegmentId(prefix: string): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/// <summary> AI Cursor </summary>
+function appendThoughtSegment(
+  segments: TurnSegment[] | undefined,
+  chunk: string,
+  segmentId?: string,
+): TurnSegment[] {
+  const next = [...(segments || [])]
+  const id = segmentId || ''
+  let i = id ? next.findIndex(s => s.kind === 'thought' && s.id === id) : -1
+  if (i < 0) {
+    const last = next[next.length - 1]
+    if (last?.kind === 'thought' && last.active) i = next.length - 1
+  }
+  if (i >= 0 && next[i].kind === 'thought') {
+    const cur = next[i]
+    next[i] = {
+      ...cur,
+      text: (cur.text || '') + chunk,
+      active: true,
+      label: cur.label || '思考中…',
+    }
+    return next
+  }
+  next.push({
+    kind: 'thought',
+    id: id || newSegmentId('thought'),
+    text: chunk,
+    active: true,
+    label: '思考中…',
+  })
+  return next
+}
+
+/// <summary> AI Cursor </summary>
+function finishThoughtSegment(
+  segments: TurnSegment[] | undefined,
+  meta?: { segmentId?: string; ms?: number; label?: string },
+): TurnSegment[] {
+  const next = [...(segments || [])]
+  let i = meta?.segmentId
+    ? next.findIndex(s => s.kind === 'thought' && s.id === meta.segmentId)
+    : -1
+  if (i < 0)
+    i = [...next]
+      .map((s, idx) => ({ s, idx }))
+      .reverse()
+      .find(x => x.s.kind === 'thought' && x.s.active)?.idx ?? -1
+  if (i < 0) return next
+  const cur = next[i]
+  if (cur.kind !== 'thought') return next
+  const ms = typeof meta?.ms === 'number' ? meta.ms : cur.ms || 0
+  next[i] = {
+    ...cur,
+    active: false,
+    ms,
+    label: meta?.label || cur.label || `思考了 ${Math.max(1, Math.round(ms / 1000))}秒`,
+  }
+  return next
+}
+
+/// <summary> AI Cursor </summary>
+function upsertToolCall(
+  list: ToolCallItem[] | undefined,
+  tool: ToolCallItem,
+): ToolCallItem[] {
+  const next = [...(list || [])]
+  const i = next.findIndex(t => t.toolId && t.toolId === tool.toolId)
+  if (i >= 0) next[i] = { ...next[i], ...tool }
+  else next.push(tool)
+  return next
+}
+
+/// <summary> AI Cursor </summary>
+function upsertToolSegment(
+  segments: TurnSegment[] | undefined,
+  tool: ToolCallItem,
+): TurnSegment[] {
+  const next = [...(segments || [])]
+  const segId = tool.segmentId
+  let i = segId
+    ? next.findIndex(s => s.kind === 'tool' && s.id === segId)
+    : -1
+  if (i < 0 && tool.toolId)
+    i = next.findIndex(
+      s => s.kind === 'tool' && s.toolId === tool.toolId,
+    )
+  const patch: TurnSegment = {
+    kind: 'tool',
+    id: segId || tool.toolId || newSegmentId('tool'),
+    toolId: tool.toolId,
+    name: tool.name || 'Tool',
+    preview: tool.preview || '',
+    input: tool.input || {},
+    active: tool.ready === false,
+  }
+  if (i >= 0) next[i] = { ...next[i], ...patch, kind: 'tool' }
+  else next.push(patch)
+  return next
+}
+
+/// <summary> AI Cursor </summary>
+function appendReplySegment(
+  segments: TurnSegment[] | undefined,
+  chunk: string,
+  segmentId?: string,
+): TurnSegment[] {
+  const next = [...(segments || [])]
+  const id = segmentId || ''
+  let i = id ? next.findIndex(s => s.kind === 'reply' && s.id === id) : -1
+  if (i < 0) {
+    const last = next[next.length - 1]
+    if (last?.kind === 'reply') i = next.length - 1
+  }
+  if (i >= 0 && next[i].kind === 'reply') {
+    const cur = next[i]
+    next[i] = { ...cur, text: (cur.text || '') + chunk }
+    return next
+  }
+  next.push({
+    kind: 'reply',
+    id: id || newSegmentId('reply'),
+    text: chunk,
+  })
+  return next
 }
 
 /// <summary> AI Cursor </summary>
@@ -152,6 +289,31 @@ function readFileAsChatImage(file: File): Promise<ChatImage | null> {
   })
 }
 
+type StreamProgressState = {
+  assistantId: string | null
+  status: string
+  steps: { kind: 'status' | 'tool'; text: string }[]
+  activity: ActivityItem[]
+  filesChanged: FileChangeItem[]
+  filesRead: string[]
+  tools: ToolCallItem[]
+  webPages: WebPageItem[]
+  startedAt: number
+  phase: StreamPhase
+  phaseStartedAt: number
+  firstTokenAt: number | null
+  contentChars: number
+  toolCount: number
+  etaSec: number | null
+}
+
+type SessionStreamCache = {
+  busy: boolean
+  streamProgress: StreamProgressState | null
+  liveMessages: ChatMessage[]
+  error: string | null
+}
+
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [sessionBucket, setSessionBucket] = useState<SessionStatus>('active')
@@ -170,27 +332,23 @@ export default function App() {
   const [title, setTitle] = useState('新会话')
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [streamProgress, setStreamProgress] = useState<{
-    assistantId: string | null
-    status: string
-    steps: { kind: 'status' | 'tool'; text: string }[]
-    activity: ActivityItem[]
-    filesChanged: FileChangeItem[]
-    startedAt: number
-    phase: StreamPhase
-    phaseStartedAt: number
-    firstTokenAt: number | null
-    contentChars: number
-    toolCount: number
-    etaSec: number | null
-  } | null>(null)
+  const [streamProgress, setStreamProgress] = useState<StreamProgressState | null>(
+    null,
+  )
   const [elapsedSec, setElapsedSec] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(
+    () => new Set(),
+  )
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const [vramPanelOpen, setVramPanelOpen] = useState(false)
   const [settings, setSettings] = useState<SettingsPublic | null>(null)
   const [formKey, setFormKey] = useState('')
+  const [formTavilyKey, setFormTavilyKey] = useState('')
+  const [formWebSearchBackend, setFormWebSearchBackend] = useState<
+    'local' | 'tavily'
+  >('local')
   const [formBase, setFormBase] = useState('https://api.chatanywhere.tech/v1')
   const [formModel, setFormModel] = useState('gpt-4o-mini')
   const [formCwd, setFormCwd] = useState('')
@@ -207,8 +365,104 @@ export default function App() {
     loading: boolean
     error: string | null
   } | null>(null)
+  const [turnDetailsMsg, setTurnDetailsMsg] = useState<ChatMessage | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
+  const abortBySessionRef = useRef<Map<string, AbortController>>(new Map())
+  const streamCacheRef = useRef<Map<string, SessionStreamCache>>(new Map())
+  const activeIdRef = useRef<string | null>(null)
+  const messagesRef = useRef<ChatMessage[]>([])
+  const busyRef = useRef(false)
+  const streamProgressRef = useRef<StreamProgressState | null>(null)
+  const errorRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    activeIdRef.current = activeId
+  }, [activeId])
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
+  useEffect(() => {
+    streamProgressRef.current = streamProgress
+  }, [streamProgress])
+  useEffect(() => {
+    errorRef.current = error
+  }, [error])
+
+  /// <summary> AI Cursor </summary>
+  const setSessionStreamingFlag = useCallback((sessionId: string, on: boolean) => {
+    setStreamingSessionIds(prev => {
+      const has = prev.has(sessionId)
+      if (on === has) return prev
+      const next = new Set(prev)
+      if (on) next.add(sessionId)
+      else next.delete(sessionId)
+      return next
+    })
+  }, [])
+
+  /// <summary> AI Cursor </summary>
+  const stashActiveSessionStream = useCallback(() => {
+    const id = activeIdRef.current
+    if (!id) return
+    if (!busyRef.current && !streamCacheRef.current.get(id)?.busy) return
+    streamCacheRef.current.set(id, {
+      busy: true,
+      streamProgress: streamProgressRef.current,
+      liveMessages: messagesRef.current,
+      error: errorRef.current,
+    })
+  }, [])
+
+  /// <summary> AI Cursor </summary>
+  const patchCachedMessages = useCallback(
+    (sessionId: string, updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+      const cache = streamCacheRef.current.get(sessionId)
+      const base =
+        cache?.liveMessages ||
+        (activeIdRef.current === sessionId ? messagesRef.current : [])
+      const next = updater(base)
+      const prevCache = cache || {
+        busy: true,
+        streamProgress: null as StreamProgressState | null,
+        liveMessages: next,
+        error: null as string | null,
+      }
+      streamCacheRef.current.set(sessionId, {
+        ...prevCache,
+        busy: true,
+        liveMessages: next,
+      })
+      if (activeIdRef.current === sessionId) setMessages(next)
+    },
+    [],
+  )
+
+  /// <summary> AI Cursor </summary>
+  const patchCachedProgress = useCallback(
+    (
+      sessionId: string,
+      updater: (prev: StreamProgressState | null) => StreamProgressState | null,
+    ) => {
+      const cache = streamCacheRef.current.get(sessionId)
+      const prev =
+        cache?.streamProgress ??
+        (activeIdRef.current === sessionId ? streamProgressRef.current : null)
+      const next = updater(prev)
+      streamCacheRef.current.set(sessionId, {
+        busy: true,
+        streamProgress: next,
+        liveMessages:
+          cache?.liveMessages ||
+          (activeIdRef.current === sessionId ? messagesRef.current : []),
+        error: cache?.error ?? null,
+      })
+      if (activeIdRef.current === sessionId) setStreamProgress(next)
+    },
+    [],
+  )
 
   const refreshSessions = useCallback(async (bucket: SessionStatus) => {
     const list = await fetchSessions(bucket)
@@ -221,17 +475,30 @@ export default function App() {
     return list
   }, [])
 
-  const loadSession = useCallback(async (id: string) => {
-    const session = await fetchSession(id)
-    setActiveId(session.id)
-    setTitle(session.title)
-    setMessages(session.messages)
-    setError(null)
-    const st: SessionStatus =
-      session.status === 'discarded' ? 'discarded' : 'active'
-    setSessionBucket(st)
-    return session
-  }, [])
+  const loadSession = useCallback(
+    async (id: string) => {
+      stashActiveSessionStream()
+      const session = await fetchSession(id)
+      const cached = streamCacheRef.current.get(id)
+      setActiveId(session.id)
+      setTitle(session.title)
+      setError(cached?.error ?? null)
+      const st: SessionStatus =
+        session.status === 'discarded' ? 'discarded' : 'active'
+      setSessionBucket(st)
+      if (cached?.busy && cached.liveMessages?.length) {
+        setMessages(cached.liveMessages)
+        setBusy(true)
+        setStreamProgress(cached.streamProgress)
+      } else {
+        setMessages(session.messages)
+        setBusy(false)
+        setStreamProgress(null)
+      }
+      return session
+    },
+    [stashActiveSessionStream],
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -297,7 +564,14 @@ export default function App() {
               : null,
         })
         if (prev.etaSec === etaSec) return prev
-        return { ...prev, etaSec }
+        const next = { ...prev, etaSec }
+        const sid = activeIdRef.current
+        if (sid) {
+          const cache = streamCacheRef.current.get(sid)
+          if (cache?.busy)
+            streamCacheRef.current.set(sid, { ...cache, streamProgress: next })
+        }
+        return next
       })
     }
     tick()
@@ -350,9 +624,13 @@ export default function App() {
       await refreshSessions('active')
       await loadSession(created.id)
     } else {
+      stashActiveSessionStream()
       setActiveId(null)
       setTitle('遗弃')
       setMessages([])
+      setBusy(false)
+      setStreamProgress(null)
+      setError(null)
     }
   }
 
@@ -363,8 +641,21 @@ export default function App() {
     await loadSession(created.id)
   }
 
+  /// <summary> AI Cursor </summary>
+  function abortSessionStream(id: string) {
+    abortBySessionRef.current.get(id)?.abort()
+    abortBySessionRef.current.delete(id)
+    streamCacheRef.current.delete(id)
+    setSessionStreamingFlag(id, false)
+    if (activeIdRef.current === id) {
+      setBusy(false)
+      setStreamProgress(null)
+    }
+  }
+
   /// <summary> AI Cursor — move to discarded (not permanent) </summary>
   async function onDiscardSession(id: string) {
+    abortSessionStream(id)
     await discardSession(id)
     const list = await refreshSessions('active')
     setSessionBucket('active')
@@ -388,6 +679,7 @@ export default function App() {
 
   /// <summary> AI Cursor </summary>
   async function onPermanentDeleteSession(id: string) {
+    abortSessionStream(id)
     await deleteSessionPermanent(id)
     const list = await refreshSessions('discarded')
     if (activeId === id) {
@@ -458,6 +750,12 @@ export default function App() {
       setFormCwd(s.cwd || '')
       setPlanMode(Boolean(s.planMode))
       setFormKey(s.apiKey || '')
+      setFormTavilyKey(
+        s.tavilyApiKeySet ? s.tavilyApiKeyPreview || '********' : '',
+      )
+      setFormWebSearchBackend(
+        s.webSearchBackend === 'tavily' ? 'tavily' : 'local',
+      )
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setError(
@@ -486,14 +784,37 @@ export default function App() {
     setSavingSettings(true)
     setError(null)
     try {
+      const nextTavilyKey =
+        formTavilyKey.trim() &&
+        formTavilyKey.trim() !== '********' &&
+        !formTavilyKey.includes('…')
+          ? formTavilyKey.trim()
+          : ''
+      if (
+        formWebSearchBackend === 'tavily' &&
+        !nextTavilyKey &&
+        !settings?.tavilyApiKeySet
+      ) {
+        setError('已选 Tavily，请先填写 Tavily API Key')
+        setSavingSettings(false)
+        return
+      }
       const saved = await saveSettings({
         baseUrl: formBase.trim(),
         model: (settings?.model || formModel).trim(),
         cwd: formCwd.trim(),
         apiKey: formKey.trim() || undefined,
+        webSearchBackend: formWebSearchBackend,
+        ...(nextTavilyKey ? { tavilyApiKey: nextTavilyKey } : {}),
       })
       setSettings(saved)
       setFormCwd(saved.cwd || '')
+      setFormTavilyKey(
+        saved.tavilyApiKeySet ? saved.tavilyApiKeyPreview || '********' : '',
+      )
+      setFormWebSearchBackend(
+        saved.webSearchBackend === 'tavily' ? 'tavily' : 'local',
+      )
       setSettingsOpen(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -547,8 +868,10 @@ export default function App() {
     if (next.length) setPendingImages(prev => [...prev, ...next].slice(0, MAX_PENDING_IMAGES))
   }
 
+  /// <summary> AI Cursor </summary>
   async function onSend() {
-    if (!activeId || busy) return
+    const sessionId = activeId
+    if (!sessionId || busy || streamCacheRef.current.get(sessionId)?.busy) return
     if (sessionBucket === 'discarded') {
       setError('当前会话在遗弃分组中。请先点「恢复」再继续对话。')
       return
@@ -575,16 +898,41 @@ export default function App() {
       settings?.provider === 'ollama' ||
       /11434|ollama/i.test(String(settings?.baseUrl || ''))
     const turnStartedAt = Date.now()
-    setInput('')
-    setPendingImages([])
-    setBusy(true)
-    setError(null)
-    setStreamProgress({
-      assistantId: null,
+    const genId = () =>
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const optimisticUserId = genId()
+    const placeholderId = genId()
+    const optimisticUser: ChatMessage = {
+      id: optimisticUserId,
+      role: 'user',
+      content: text,
+      createdAt: new Date().toISOString(),
+      ...(images.length
+        ? {
+            images: images.map(img => ({
+              id: img.id,
+              name: img.name,
+              mediaType: img.mediaType,
+              dataUrl:
+                img.dataUrl ||
+                (img.data
+                  ? `data:${img.mediaType};base64,${img.data}`
+                  : undefined),
+            })),
+          }
+        : {}),
+    }
+    const initialProgress: StreamProgressState = {
+      assistantId: placeholderId,
       status: '正在发送…',
       steps: [],
       activity: [],
       filesChanged: [],
+      filesRead: [],
+      tools: [],
+      webPages: [],
       startedAt: turnStartedAt,
       phase: 'sending',
       phaseStartedAt: turnStartedAt,
@@ -592,18 +940,50 @@ export default function App() {
       contentChars: 0,
       toolCount: 0,
       etaSec: null,
+    }
+    const initialMessages: ChatMessage[] = [
+      ...messagesRef.current,
+      optimisticUser,
+      {
+        id: placeholderId,
+        role: 'assistant',
+        content: '',
+        createdAt: new Date().toISOString(),
+      },
+    ]
+    setInput('')
+    setPendingImages([])
+    setError(null)
+    setBusy(true)
+    setMessages(initialMessages)
+    setStreamProgress(initialProgress)
+    streamCacheRef.current.set(sessionId, {
+      busy: true,
+      streamProgress: initialProgress,
+      liveMessages: initialMessages,
+      error: null,
     })
+    setSessionStreamingFlag(sessionId, true)
 
-    let liveAssistantId: string | null = null
+    let liveAssistantId: string | null = placeholderId
     let firstTokenAt: number | null = null
-    abortRef.current = new AbortController()
+    const abort = new AbortController()
+    abortBySessionRef.current.set(sessionId, abort)
+
+    /// <summary> AI Cursor </summary>
+    const setSessionError = (message: string | null) => {
+      const cache = streamCacheRef.current.get(sessionId)
+      if (cache)
+        streamCacheRef.current.set(sessionId, { ...cache, error: message })
+      if (activeIdRef.current === sessionId) setError(message)
+    }
 
     const pushProgress = (
       kind: 'status' | 'tool',
       progressText: string,
       assistantMsgId?: string,
     ) => {
-      setStreamProgress(prev => {
+      patchCachedProgress(sessionId, prev => {
         const now = Date.now()
         const base = prev || {
           assistantId: null,
@@ -611,6 +991,9 @@ export default function App() {
           steps: [] as { kind: 'status' | 'tool'; text: string }[],
           activity: [] as ActivityItem[],
           filesChanged: [] as FileChangeItem[],
+          filesRead: [] as string[],
+          tools: [] as ToolCallItem[],
+          webPages: [] as WebPageItem[],
           startedAt: now,
           phase: 'unknown' as StreamPhase,
           phaseStartedAt: now,
@@ -620,7 +1003,6 @@ export default function App() {
           etaSec: null,
         }
         let toolCount = base.toolCount
-        // Only keep tool steps as rare fallback; status is phase-mapped in UI.
         const steps =
           kind === 'tool'
             ? (() => {
@@ -653,21 +1035,47 @@ export default function App() {
 
     try {
       await streamChat(
-        activeId,
+        sessionId,
         text,
         {
-          onUser: msg => setMessages(prev => [...prev, msg]),
+          onUser: msg => {
+            patchCachedMessages(sessionId, prev => {
+              const i = prev.findIndex(m => m.id === optimisticUserId)
+              if (i >= 0) {
+                const next = [...prev]
+                next[i] = { ...next[i], ...msg, id: msg.id }
+                return next
+              }
+              if (prev.some(m => m.id === msg.id)) return prev
+              const ai = prev.findIndex(m => m.id === placeholderId)
+              if (ai >= 0) {
+                const next = [...prev]
+                next.splice(ai, 0, msg)
+                return next
+              }
+              return [...prev, msg]
+            })
+          },
           onAssistantStart: id => {
             liveAssistantId = id
-            setStreamProgress(prev =>
+            patchCachedProgress(sessionId, prev =>
               prev
-                ? { ...prev, assistantId: id, status: prev.status || '正在启动…' }
+                ? {
+                    ...prev,
+                    assistantId: id,
+                    status: prev.status || '正在启动…',
+                    phase:
+                      prev.phase === 'sending' ? ('boot' as StreamPhase) : prev.phase,
+                  }
                 : {
                     assistantId: id,
                     status: '正在启动…',
                     steps: [],
                     activity: [],
                     filesChanged: [],
+                    filesRead: [],
+                    tools: [],
+                    webPages: [],
                     startedAt: Date.now(),
                     phase: 'boot' as StreamPhase,
                     phaseStartedAt: Date.now(),
@@ -677,20 +1085,29 @@ export default function App() {
                     etaSec: null,
                   },
             )
-            setMessages(prev => [
-              ...prev,
-              {
-                id,
-                role: 'assistant',
-                content: '',
-                createdAt: new Date().toISOString(),
-              },
-            ])
+            patchCachedMessages(sessionId, prev => {
+              const i = prev.findIndex(m => m.id === placeholderId)
+              if (i >= 0) {
+                const next = [...prev]
+                next[i] = { ...next[i], id }
+                return next
+              }
+              if (prev.some(m => m.id === id)) return prev
+              return [
+                ...prev,
+                {
+                  id,
+                  role: 'assistant',
+                  content: '',
+                  createdAt: new Date().toISOString(),
+                },
+              ]
+            })
           },
-          onDelta: (id, delta) => {
+          onDelta: (id, delta, segmentId) => {
             const now = Date.now()
             if (firstTokenAt == null && String(delta || '').trim()) firstTokenAt = now
-            setStreamProgress(prev => {
+            patchCachedProgress(sessionId, prev => {
               if (!prev) return prev
               const nextChars = prev.contentChars + String(delta || '').length
               const phase =
@@ -709,18 +1126,26 @@ export default function App() {
                     : '正在写回复…',
               }
             })
-            setMessages(prev =>
-              prev.map(m =>
-                m.id === id ? { ...m, content: m.content + delta } : m,
-              ),
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m => {
+                if (m.id !== id) return m
+                const next: ChatMessage = {
+                  ...m,
+                  content: m.content + delta,
+                }
+                if (segmentId)
+                  next.segments = appendReplySegment(m.segments, delta, segmentId)
+                return next
+              }),
             )
           },
-          onThinking: (id, chunk) => {
+          onThinking: (id, chunk, segmentId) => {
             if (!chunk) return
+            const segKey = segmentId || id
             setThinkingOpen(prev =>
-              prev[id] ? prev : { ...prev, [id]: true },
+              prev[segKey] ? prev : { ...prev, [segKey]: true },
             )
-            setStreamProgress(prev => {
+            patchCachedProgress(sessionId, prev => {
               if (!prev) return prev
               const phase = 'thinking' as StreamPhase
               return {
@@ -731,23 +1156,38 @@ export default function App() {
                   phase !== prev.phase ? Date.now() : prev.phaseStartedAt,
               }
             })
-            setMessages(prev =>
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m => {
+                if (m.id !== id) return m
+                return {
+                  ...m,
+                  thinking: (m.thinking || '') + chunk,
+                  segments: appendThoughtSegment(m.segments, chunk, segmentId),
+                }
+              }),
+            )
+            if (activeIdRef.current === sessionId)
+              requestAnimationFrame(() => {
+                const el = document.querySelector(
+                  `[data-thinking-body="${CSS.escape(segKey)}"]`,
+                ) as HTMLElement | null
+                if (el) el.scrollTop = el.scrollHeight
+              })
+          },
+          onThinkingDone: (id, meta) => {
+            if (!id) return
+            const segKey = meta?.segmentId || id
+            setThinkingOpen(prev => ({ ...prev, [segKey]: false }))
+            patchCachedMessages(sessionId, prev =>
               prev.map(m =>
                 m.id === id
-                  ? { ...m, thinking: (m.thinking || '') + chunk }
+                  ? {
+                      ...m,
+                      segments: finishThoughtSegment(m.segments, meta),
+                    }
                   : m,
               ),
             )
-            requestAnimationFrame(() => {
-              const el = document.querySelector(
-                `[data-thinking-body="${CSS.escape(id)}"]`,
-              ) as HTMLElement | null
-              if (el) el.scrollTop = el.scrollHeight
-            })
-          },
-          onThinkingDone: id => {
-            if (!id) return
-            setThinkingOpen(prev => ({ ...prev, [id]: false }))
           },
           onStatus: (id, statusText) => {
             if (statusText) pushProgress('status', statusText, id || undefined)
@@ -755,10 +1195,59 @@ export default function App() {
           onTool: (id, tool) => {
             const label = `调用工具 ${tool.name}${tool.preview ? ` · ${tool.preview}` : ''}`
             pushProgress('tool', label, id || undefined)
+            patchCachedProgress(sessionId, prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    tools: upsertToolCall(prev.tools, tool),
+                  }
+                : prev,
+            )
+            if (!id) return
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m =>
+                m.id === id
+                  ? {
+                      ...m,
+                      tools: upsertToolCall(m.tools, tool),
+                      segments: upsertToolSegment(m.segments, tool),
+                    }
+                  : m,
+              ),
+            )
+          },
+          onToolUpdate: (id, tool) => {
+            const label = `调用工具 ${tool.name}${tool.preview ? ` · ${tool.preview}` : ''}`
+            pushProgress('tool', label, id || undefined)
+            patchCachedProgress(sessionId, prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    tools: upsertToolCall(prev.tools, tool),
+                  }
+                : prev,
+            )
+            if (!id) return
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m =>
+                m.id === id
+                  ? {
+                      ...m,
+                      tools: upsertToolCall(m.tools, tool),
+                      segments: upsertToolSegment(m.segments, {
+                        ...tool,
+                        ready: true,
+                      }),
+                    }
+                  : m,
+              ),
+            )
           },
           onActivity: (id, item) => {
             if (!item?.text) return
-            setStreamProgress(prev =>
+            patchCachedProgress(sessionId, prev =>
               prev
                 ? {
                     ...prev,
@@ -768,7 +1257,7 @@ export default function App() {
                 : prev,
             )
             if (!id) return
-            setMessages(prev =>
+            patchCachedMessages(sessionId, prev =>
               prev.map(m =>
                 m.id === id
                   ? { ...m, activity: upsertActivity(m.activity, item) }
@@ -778,7 +1267,7 @@ export default function App() {
           },
           onFilesChanged: (id, files) => {
             const list = Array.isArray(files) ? files.filter(f => f.filePath) : []
-            setStreamProgress(prev =>
+            patchCachedProgress(sessionId, prev =>
               prev
                 ? {
                     ...prev,
@@ -788,10 +1277,42 @@ export default function App() {
                 : prev,
             )
             if (!id) return
-            setMessages(prev =>
+            patchCachedMessages(sessionId, prev =>
               prev.map(m =>
                 m.id === id ? { ...m, filesChanged: list } : m,
               ),
+            )
+          },
+          onFilesRead: (id, files) => {
+            const list = Array.isArray(files) ? files.filter(Boolean) : []
+            patchCachedProgress(sessionId, prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    filesRead: list,
+                  }
+                : prev,
+            )
+            if (!id) return
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m => (m.id === id ? { ...m, filesRead: list } : m)),
+            )
+          },
+          onWebPages: (id, pages) => {
+            const list = Array.isArray(pages) ? pages.filter(p => p.url) : []
+            patchCachedProgress(sessionId, prev =>
+              prev
+                ? {
+                    ...prev,
+                    assistantId: id || prev.assistantId,
+                    webPages: list,
+                  }
+                : prev,
+            )
+            if (!id) return
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m => (m.id === id ? { ...m, webPages: list } : m)),
             )
           },
           onDone: (msg, meta) => {
@@ -807,29 +1328,52 @@ export default function App() {
               turnSec,
             })
             setThinkingOpen(prev => ({ ...prev, [msg.id]: false }))
-            setMessages(prev => prev.map(m => (m.id === msg.id ? msg : m)))
-            setTitle(meta.title)
+            patchCachedMessages(sessionId, prev =>
+              prev.map(m => (m.id === msg.id ? msg : m)),
+            )
+            if (activeIdRef.current === sessionId) setTitle(meta.title)
             void refreshSessions(sessionBucket)
           },
-          onError: message => setError(message),
+          onError: message => setSessionError(message),
         },
-        abortRef.current.signal,
+        abort.signal,
         images,
       )
     } catch (e) {
-      if ((e as Error).name === 'AbortError') return
+      if ((e as Error).name === 'AbortError') {
+        patchCachedMessages(sessionId, prev =>
+          prev.filter(
+            m =>
+              !(
+                m.role === 'assistant' &&
+                !String(m.content || '').trim() &&
+                (m.id === placeholderId || m.id === liveAssistantId)
+              ),
+          ),
+        )
+        return
+      }
       const msg = e instanceof Error ? e.message : String(e)
-      setError(
+      setSessionError(
         /NetworkError|Failed to fetch|network/i.test(msg)
-          ? '发送失败：本地服务已断开或崩溃。请重新运行「测试 by o0」，并查看 o0\\.cache\\gui-server.log'
+          ? '发送失败：本地服务已断开或崩溃。请重新运行「测试 by o0」，并查看 o0\\Temp\\gui-server.log'
           : msg,
       )
       if (liveAssistantId)
-        setMessages(prev => prev.filter(m => m.id !== liveAssistantId))
+        patchCachedMessages(sessionId, prev =>
+          prev.filter(m => m.id !== liveAssistantId),
+        )
     } finally {
-      setBusy(false)
-      setStreamProgress(null)
-      abortRef.current = null
+      const finished = streamCacheRef.current.get(sessionId)
+      streamCacheRef.current.delete(sessionId)
+      abortBySessionRef.current.delete(sessionId)
+      setSessionStreamingFlag(sessionId, false)
+      if (activeIdRef.current === sessionId) {
+        setBusy(false)
+        setStreamProgress(null)
+        if (finished?.liveMessages?.length)
+          setMessages(finished.liveMessages)
+      }
     }
   }
 
@@ -1002,7 +1546,7 @@ export default function App() {
               tabIndex={0}
               draggable={renamingId !== s.id}
               data-session-row={s.id}
-              className={`session-item${s.id === activeId ? ' active' : ''}${sessionBucket === 'discarded' ? ' discarded' : ''}${draggingSessionId === s.id ? ' dragging' : ''}${sessionMenuId === s.id ? ' menu-open' : ''}`}
+              className={`session-item${s.id === activeId ? ' active' : ''}${sessionBucket === 'discarded' ? ' discarded' : ''}${draggingSessionId === s.id ? ' dragging' : ''}${sessionMenuId === s.id ? ' menu-open' : ''}${streamingSessionIds.has(s.id) ? ' streaming' : ''}`}
               onClick={() => {
                 if (renamingId === s.id) return
                 if (sessionDragMovedRef.current) {
@@ -1061,11 +1605,18 @@ export default function App() {
                 />
               ) : (
                 <>
-                  <div className="session-title">{s.title}</div>
+                  <div className="session-title">
+                    {s.title}
+                    {streamingSessionIds.has(s.id) ? (
+                      <span className="session-streaming-dot" title="生成中" />
+                    ) : null}
+                  </div>
                   <div className="session-meta">
-                    {sessionBucket === 'discarded'
-                      ? `遗弃于 ${formatTime(s.discardedAt || s.updatedAt)}`
-                      : formatTime(s.updatedAt)}
+                    {streamingSessionIds.has(s.id)
+                      ? '生成中…'
+                      : sessionBucket === 'discarded'
+                        ? `遗弃于 ${formatTime(s.discardedAt || s.updatedAt)}`
+                        : formatTime(s.updatedAt)}
                   </div>
                 </>
               )}
@@ -1212,6 +1763,11 @@ export default function App() {
               m.role === 'assistant' ? splitCostFooter(m.content || '') : null
             const body = split ? split.body : m.content
             const cost = split?.cost || m.costFooter || null
+            const segments =
+              m.role === 'assistant' && Array.isArray(m.segments)
+                ? m.segments
+                : null
+            const hasSegments = Boolean(segments && segments.length)
             return (
               <div key={m.id} className={`msg ${m.role}`}>
                 <div className="role">{m.role === 'user' ? '你' : '助手'}</div>
@@ -1227,7 +1783,73 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                {m.thinking ? (
+                {hasSegments
+                  ? segments!.map(seg => {
+                      if (seg.kind === 'thought') {
+                        const open = thinkingOpen[seg.id] === true
+                        const label = seg.active
+                          ? '思考中…'
+                          : seg.label ||
+                            (typeof seg.ms === 'number'
+                              ? `思考了 ${Math.max(1, Math.round(seg.ms / 1000))}秒`
+                              : '思考')
+                        return (
+                          <details
+                            key={seg.id}
+                            className={`msg-thinking${seg.active ? ' active' : ''}`}
+                            open={open}
+                            onToggle={e => {
+                              const next = (e.currentTarget as HTMLDetailsElement)
+                                .open
+                              setThinkingOpen(prev => ({
+                                ...prev,
+                                [seg.id]: next,
+                              }))
+                            }}
+                          >
+                            <summary>{label}</summary>
+                            <div
+                              className="msg-thinking-body"
+                              data-thinking-body={seg.id}
+                            >
+                              {seg.text ||
+                                (seg.active ? '…' : '（无思考内容）')}
+                            </div>
+                          </details>
+                        )
+                      }
+                      if (seg.kind === 'tool') {
+                        const preview =
+                          seg.preview ||
+                          (seg.input && Object.keys(seg.input).length
+                            ? JSON.stringify(seg.input)
+                            : '')
+                        return (
+                          <div
+                            key={seg.id}
+                            className={`msg-tool-call${seg.active ? ' active' : ''}`}
+                          >
+                            <span className="msg-tool-name">{seg.name}</span>
+                            {preview ? (
+                              <span className="msg-tool-preview" title={preview}>
+                                {preview}
+                              </span>
+                            ) : (
+                              <span className="msg-tool-preview muted">
+                                {seg.active ? '参数接收中…' : ''}
+                              </span>
+                            )}
+                          </div>
+                        )
+                      }
+                      return (
+                        <div key={seg.id} className="msg-body msg-body-segment">
+                          {seg.text}
+                        </div>
+                      )
+                    })
+                  : null}
+                {!hasSegments && m.thinking ? (
                   <details
                     className="msg-thinking"
                     open={thinkingOpen[m.id] === true}
@@ -1252,28 +1874,69 @@ export default function App() {
                     </div>
                   </details>
                 ) : null}
-                <div className="msg-body">
-                  {body ||
-                    (busy && streamProgress?.assistantId === m.id ? (
+                {!hasSegments && (
+                  <div className="msg-body">
+                    {body ||
+                      (busy && streamProgress?.assistantId === m.id ? (
+                        <span className="stream-waiting">正在写回复…</span>
+                      ) : (
+                        ''
+                      ))}
+                  </div>
+                )}
+                {hasSegments &&
+                  busy &&
+                  streamProgress?.assistantId === m.id &&
+                  !segments!.some(
+                    s =>
+                      (s.kind === 'reply' && s.text) ||
+                      (s.kind === 'thought' && s.text),
+                  ) && (
+                    <div className="msg-body">
                       <span className="stream-waiting">正在写回复…</span>
-                    ) : (
-                      ''
-                    ))}
-                </div>
+                    </div>
+                  )}
                 {(() => {
                   const live =
                     busy && streamProgress?.assistantId === m.id
                       ? streamProgress
                       : null
-                  const activity =
+                  const activity = (
                     (live?.activity?.length
                       ? live.activity
                       : m.activity) || []
+                  ).filter(item => item.kind !== 'thought')
                   const files =
                     (live?.filesChanged?.length
                       ? live.filesChanged
                       : m.filesChanged) || []
-                  if (!activity.length && !files.length && !live) return null
+                  const tools =
+                    (live?.tools?.length ? live.tools : m.tools) || []
+                  const pages =
+                    (live?.webPages?.length ? live.webPages : m.webPages) || []
+                  const filesRead =
+                    (live?.filesRead?.length ? live.filesRead : m.filesRead) ||
+                    []
+                  const detailMsg: ChatMessage = {
+                    ...m,
+                    tools,
+                    webPages: pages,
+                    filesChanged: files,
+                    filesRead,
+                  }
+                  const hasDetails =
+                    Boolean(m.promptRecord) ||
+                    tools.length > 0 ||
+                    pages.length > 0 ||
+                    files.length > 0 ||
+                    filesRead.length > 0
+                  if (
+                    !activity.length &&
+                    !files.length &&
+                    !live &&
+                    !hasDetails
+                  )
+                    return null
                   const liveIsLocal =
                     settings?.provider === 'ollama' ||
                     /11434|ollama/i.test(String(settings?.baseUrl || ''))
@@ -1284,7 +1947,10 @@ export default function App() {
                       })
                     : null
                   const showWaitCard =
-                    Boolean(live) && activity.length === 0 && !files.length
+                    Boolean(live) &&
+                    activity.length === 0 &&
+                    !files.length &&
+                    !hasSegments
                   return (
                     <div className="msg-turn-meta">
                       {showWaitCard && wait && (
@@ -1320,16 +1986,31 @@ export default function App() {
                               className={`msg-activity-item kind-${item.kind}${item.active ? ' active' : ''}`}
                             >
                               <span className="msg-activity-mark" aria-hidden>
-                                {item.kind === 'thought'
-                                  ? '◇'
-                                  : item.kind === 'worked'
-                                    ? '✓'
-                                    : '·'}
+                                {item.kind === 'worked' ? '✓' : '·'}
                               </span>
                               <span>{item.text}</span>
                             </li>
                           ))}
                         </ul>
+                      )}
+                      {(tools.length > 0 || pages.length > 0) && (
+                        <div className="msg-turn-chips">
+                          {tools.length > 0 && (
+                            <span className="msg-chip">
+                              工具 {tools.length}
+                            </span>
+                          )}
+                          {pages.length > 0 && (
+                            <span className="msg-chip">
+                              网页 {pages.length}
+                            </span>
+                          )}
+                          {filesRead.length > 0 && (
+                            <span className="msg-chip">
+                              读 {filesRead.length}
+                            </span>
+                          )}
+                        </div>
                       )}
                       {files.length > 0 && (
                         <details className="msg-files-changed">
@@ -1368,6 +2049,15 @@ export default function App() {
                             ))}
                           </ul>
                         </details>
+                      )}
+                      {hasDetails && (
+                        <button
+                          type="button"
+                          className="btn btn-ghost msg-details-btn"
+                          onClick={() => setTurnDetailsMsg(detailMsg)}
+                        >
+                          展开完整记录
+                        </button>
                       )}
                     </div>
                   )
@@ -1514,6 +2204,13 @@ export default function App() {
         />
       )}
 
+      {turnDetailsMsg && (
+        <TurnDetailsModal
+          message={turnDetailsMsg}
+          onClose={() => setTurnDetailsMsg(null)}
+        />
+      )}
+
       {settingsOpen && (
         <div className="overlay" onClick={() => setSettingsOpen(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
@@ -1560,6 +2257,50 @@ export default function App() {
                   ollama。
                 </p>
               )}
+            </div>
+            <div className="field">
+              <label>WebSearch 后端</label>
+              <div className="websearch-backend-toggle" role="group" aria-label="WebSearch 后端">
+                <button
+                  type="button"
+                  className={
+                    formWebSearchBackend === 'local' ? 'active' : undefined
+                  }
+                  onClick={() => setFormWebSearchBackend('local')}
+                >
+                  本地 SearXNG
+                </button>
+                <button
+                  type="button"
+                  className={
+                    formWebSearchBackend === 'tavily' ? 'active' : undefined
+                  }
+                  onClick={() => setFormWebSearchBackend('tavily')}
+                >
+                  Tavily
+                </button>
+              </div>
+              <p className="hint">
+                {formWebSearchBackend === 'tavily'
+                  ? '使用 Tavily 云端搜索（约每月 1000 次免费额度）。需填写下方 API Key。'
+                  : '使用本地 SearXNG（无 Docker 时为 Bing/DDG 兼容刮页）。不消耗 Tavily 额度。'}
+              </p>
+            </div>
+            <div className="field">
+              <label>Tavily API Key</label>
+              <input
+                type="text"
+                value={formTavilyKey}
+                onChange={e => setFormTavilyKey(e.target.value)}
+                placeholder="tvly-..."
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p className="hint">
+                {settings?.tavilyApiKeySet
+                  ? `已保存（${settings.tavilyApiKeyPreview || '已配置'}）。切换到 Tavily 时生效。`
+                  : '选 Tavily 时必填。Key 会保存在本地 settings，不会上传到仓库。'}
+              </p>
             </div>
             {settings?.agentCli && (
               <p className="hint">CLI: {settings.agentCli}</p>

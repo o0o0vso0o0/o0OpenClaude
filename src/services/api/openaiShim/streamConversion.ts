@@ -407,7 +407,12 @@ export async function* openaiStreamToAnthropic(
       activeToolCalls.size > 0 ||
       bufferedRawToolCallsText !== null ||
       xmlToolCallText !== null ||
-      (isOllamaStream && parseTextToolCalls(accumulatedText).calls.length > 0)
+      (isOllamaStream &&
+        (parseTextToolCalls(accumulatedText).calls.length > 0 ||
+          parseXmlToolCalls(
+            ollamaTextBuffer || stripThinkTags(accumulatedText),
+            allowHy3ToolCalls,
+          ).calls.length > 0))
     ) {
       throw new Error('OpenAI-compatible stream ended before a tool call completed')
     }
@@ -800,12 +805,27 @@ export async function* openaiStreamToAnthropic(
           const originalFinishReason = choice.finish_reason
           let ollamaClosedContentBlock = false
           if (isTerminalOllamaFinish) {
-            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(accumulatedText)
-            if (textToolCalls.length > 0) {
+            // Qwen/GLM Dialect A XML tool calls (often missing `<tool_call>` opener).
+            // Prefer XML over JSON-in-text so raw markup never leaks as assistant text.
+            const xmlSource = ollamaTextBuffer || stripThinkTags(accumulatedText)
+            const { calls: xmlToolCalls, toolCallRanges: xmlRanges } =
+              parseXmlToolCalls(xmlSource, allowHy3ToolCalls)
+            const { calls: textToolCalls, toolCallRanges } =
+              xmlToolCalls.length > 0
+                ? { calls: [], toolCallRanges: [] as Array<[number, number]> }
+                : parseTextToolCalls(accumulatedText)
+            const fallbackCalls =
+              xmlToolCalls.length > 0 ? xmlToolCalls : textToolCalls
+            const fallbackRanges =
+              xmlToolCalls.length > 0 ? xmlRanges : toolCallRanges
+            const fallbackSource =
+              xmlToolCalls.length > 0 ? xmlSource : accumulatedText
+
+            if (fallbackCalls.length > 0) {
               ollamaClosedContentBlock = true
-              // Compute visible prose (tool-call JSON stripped, think-tags removed).
-              // Use accumulatedText (raw) as source because toolCallRanges are relative to it.
-              const stripped = stripRanges(accumulatedText, toolCallRanges).trim()
+              ollamaTextBuffer = ''
+              // Ranges are relative to fallbackSource (xml buffer or raw accumulated).
+              const stripped = stripRanges(fallbackSource, fallbackRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
               if (hasEmittedContentStart) {
                 // Text block was already open — emit stripped prose then close it.
@@ -836,7 +856,7 @@ export async function* openaiStreamToAnthropic(
                 }
                 yield* closeActiveContentBlock()
               }
-              for (const tc of textToolCalls) {
+              for (const tc of fallbackCalls) {
                 throwIfStreamAborted(signal)
                 const toolBlockIndex = contentBlockIndex
                 yield {
@@ -882,8 +902,8 @@ export async function* openaiStreamToAnthropic(
           }
 
           // XML tool-call fallback for non-Ollama OpenAI-compatible providers
-          // (GLM/Qwen emit `<tool_call><function=…>` as text). Mirror the Ollama
-          // path: convert buffered XML to tool_use blocks and strip the raw XML.
+          // (GLM/Qwen emit `<tool_call><function=…>` as text). Ollama uses the
+          // finish-time path above (ollamaTextBuffer) for the same dialect.
           let xmlClosedContentBlock = false
           if (!isOllamaStream && xmlToolCallText !== null) {
             const buffered = xmlToolCallText

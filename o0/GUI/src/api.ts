@@ -90,6 +90,45 @@ export type FileChangeItem = {
   removed: number
 }
 
+export type ToolCallItem = {
+  toolId: string
+  name: string
+  preview?: string
+  input?: Record<string, unknown>
+  ready?: boolean
+  segmentId?: string
+}
+
+export type WebPageItem = {
+  title: string
+  url: string
+  source?: string
+}
+
+export type TurnSegment =
+  | {
+      kind: 'thought'
+      id: string
+      text: string
+      ms?: number
+      label?: string
+      active?: boolean
+    }
+  | {
+      kind: 'reply'
+      id: string
+      text: string
+    }
+  | {
+      kind: 'tool'
+      id: string
+      toolId?: string
+      name: string
+      preview?: string
+      input?: Record<string, unknown>
+      active?: boolean
+    }
+
 export type ChatMessage = {
   id: string
   role: ChatRole
@@ -98,9 +137,17 @@ export type ChatMessage = {
   model?: string
   /** Model thinking / chain-of-thought (when Thinking is on). */
   thinking?: string
+  /** Interleaved thought / reply timeline for one assistant turn. */
+  segments?: TurnSegment[]
   /** TUI-parity turn activity (Worked / Searched / Wrote…). */
   activity?: ActivityItem[]
   filesChanged?: FileChangeItem[]
+  filesRead?: string[]
+  tools?: ToolCallItem[]
+  webPages?: WebPageItem[]
+  /** Expandable full turn record (user + tools + pages + files). */
+  promptRecord?: string
+  userPrompt?: string
   usage?: MessageUsage | null
   usageDetail?: UsageDetail | null
   costFooter?: string | null
@@ -135,6 +182,10 @@ export type SettingsPublic = {
   apiKey: string
   apiKeySet: boolean
   apiKeyPreview?: string
+  tavilyApiKeySet?: boolean
+  tavilyApiKeyPreview?: string
+  /** 'local' = SearXNG, 'tavily' = Tavily API */
+  webSearchBackend?: 'local' | 'tavily' | string
   cwd?: string
   planMode?: boolean
   ollamaThink?: boolean
@@ -231,6 +282,9 @@ export async function saveSettings(body: {
   planMode?: boolean
   ollamaThink?: boolean
   clearApiKey?: boolean
+  tavilyApiKey?: string
+  clearTavilyApiKey?: boolean
+  webSearchBackend?: 'local' | 'tavily'
 }): Promise<SettingsPublic> {
   return parseJson(
     await fetch('/api/settings', {
@@ -348,13 +402,19 @@ export function startGuiLifetimeHeartbeat(): () => void {
 export type StreamHandlers = {
   onUser: (msg: ChatMessage) => void
   onAssistantStart: (id: string) => void
-  onDelta: (id: string, text: string) => void
-  onThinking?: (id: string, text: string) => void
-  onThinkingDone?: (id: string) => void
+  onDelta: (id: string, text: string, segmentId?: string) => void
+  onThinking?: (id: string, text: string, segmentId?: string) => void
+  onThinkingDone?: (
+    id: string,
+    meta?: { segmentId?: string; ms?: number; label?: string },
+  ) => void
   onStatus?: (id: string, text: string) => void
-  onTool?: (id: string, tool: { toolId: string; name: string; preview?: string }) => void
+  onTool?: (id: string, tool: ToolCallItem) => void
+  onToolUpdate?: (id: string, tool: ToolCallItem) => void
   onActivity?: (id: string, item: ActivityItem) => void
   onFilesChanged?: (id: string, files: FileChangeItem[]) => void
+  onFilesRead?: (id: string, files: string[]) => void
+  onWebPages?: (id: string, pages: WebPageItem[]) => void
   onDone: (msg: ChatMessage, sessionMeta: { id: string; title: string; updatedAt: string }) => void
   onError: (message: string) => void
 }
@@ -436,19 +496,40 @@ export async function streamChat(
       else if (eventName === 'assistant_start')
         handlers.onAssistantStart(String(data.id))
       else if (eventName === 'delta')
-        handlers.onDelta(String(data.id), String(data.text || ''))
+        handlers.onDelta(
+          String(data.id),
+          String(data.text || ''),
+          data.segmentId ? String(data.segmentId) : undefined,
+        )
       else if (eventName === 'thinking')
-        handlers.onThinking?.(String(data.id), String(data.text || ''))
+        handlers.onThinking?.(
+          String(data.id),
+          String(data.text || ''),
+          data.segmentId ? String(data.segmentId) : undefined,
+        )
       else if (eventName === 'thinking_done')
-        handlers.onThinkingDone?.(String(data.id || ''))
+        handlers.onThinkingDone?.(String(data.id || ''), {
+          segmentId: data.segmentId ? String(data.segmentId) : undefined,
+          ms: typeof data.ms === 'number' ? data.ms : undefined,
+          label: data.label ? String(data.label) : undefined,
+        })
       else if (eventName === 'status')
         handlers.onStatus?.(String(data.id || ''), String(data.text || ''))
-      else if (eventName === 'tool')
-        handlers.onTool?.(String(data.id || ''), {
+      else if (eventName === 'tool' || eventName === 'tool_update') {
+        const tool: ToolCallItem = {
           toolId: String(data.toolId || ''),
           name: String(data.name || 'Tool'),
           preview: data.preview ? String(data.preview) : '',
-        })
+          input:
+            data.input && typeof data.input === 'object'
+              ? (data.input as Record<string, unknown>)
+              : {},
+          ready: Boolean(data.ready),
+          segmentId: data.segmentId ? String(data.segmentId) : undefined,
+        }
+        if (eventName === 'tool_update') handlers.onToolUpdate?.(String(data.id || ''), tool)
+        else handlers.onTool?.(String(data.id || ''), tool)
+      }
       else if (eventName === 'activity')
         handlers.onActivity?.(String(data.id || ''), {
           kind: String(data.kind || 'tool'),
@@ -464,6 +545,24 @@ export async function streamChat(
                 filePath: String(f.filePath || ''),
                 added: Number(f.added) || 0,
                 removed: Number(f.removed) || 0,
+              }))
+            : [],
+        )
+      else if (eventName === 'files_read')
+        handlers.onFilesRead?.(
+          String(data.id || ''),
+          Array.isArray(data.files)
+            ? data.files.map(f => String(f || '')).filter(Boolean)
+            : [],
+        )
+      else if (eventName === 'web_pages')
+        handlers.onWebPages?.(
+          String(data.id || ''),
+          Array.isArray(data.pages)
+            ? (data.pages as WebPageItem[]).map(p => ({
+                title: String(p.title || p.url || ''),
+                url: String(p.url || ''),
+                source: p.source ? String(p.source) : undefined,
               }))
             : [],
         )

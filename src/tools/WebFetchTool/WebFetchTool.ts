@@ -7,7 +7,7 @@ import { lazySchema } from '../../utils/lazySchema.js'
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
 import { getRuleByContentsForTool } from '../../utils/permissions/permissions.js'
 import { isPreapprovedHost } from './preapproved.js'
-import { DESCRIPTION, WEB_FETCH_TOOL_NAME } from './prompt.js'
+import { DESCRIPTION, isSearchEngineResultsUrl, WEB_FETCH_TOOL_NAME } from './prompt.js'
 import {
   getToolUseSummary,
   renderToolResultMessage,
@@ -88,7 +88,8 @@ export const WebFetchTool = buildTool({
   searchHint: 'fetch and extract content from a URL',
   // 100K chars - tool result persistence threshold
   maxResultSizeChars: 100_000,
-  shouldDefer: true,
+  // Keep with WebSearch: always available so models need not ToolSearch first.
+  shouldDefer: false,
   async description(input) {
     const { url } = input as { url: string }
     try {
@@ -218,6 +219,15 @@ ${DESCRIPTION}`
         message: `Error: Invalid URL "${url}". The URL provided could not be parsed.`,
         meta: { reason: 'invalid_url' },
         errorCode: 1,
+      }
+    }
+    if (isSearchEngineResultsUrl(url)) {
+      return {
+        result: false,
+        message:
+          'Error: WebFetch cannot be used on search-engine result pages (Google/Bing/DuckDuckGo/Baidu/etc). Call WebSearch with a text query to find sources, then WebFetch only concrete article, product, or wiki URLs from those results.',
+        meta: { reason: 'search_engine_serp' },
+        errorCode: 2,
       }
     }
     return { result: true }

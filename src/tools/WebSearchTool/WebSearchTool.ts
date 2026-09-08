@@ -577,7 +577,10 @@ export const WebSearchTool = buildTool({
   name: WEB_SEARCH_TOOL_NAME,
   searchHint: 'search the web for current information',
   maxResultSizeChars: 100_000,
-  shouldDefer: true,
+  // Always load on the wire: local/OpenAI models often plan ToolSearch in
+  // thinking then end_turn without ever calling it. Deferred WebSearch made
+  // "search …" turns fail with an empty reply.
+  shouldDefer: false,
   async description(input) {
     return `${PRODUCT_DISPLAY_NAME} wants to search the web for: ${input.query}`
   },

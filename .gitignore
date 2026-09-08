@@ -27,7 +27,12 @@ plan/
 temp_reference/
 # Local pack scripts keep sources; ignore built production package.
 /o0/Release/
-/o0/.cache/
+# Runtime cache / logs / downloads under Temp (keep intentional demos tracked)
+/o0/Temp/*
+!/o0/Temp/session-rename-ui-demos.html
+/o0/WebSearch/.compat.port
+/o0/WebSearch/.compat.pid
+/o0/WebSearch/compat.log
 /o0/GUI/node_modules/
 /o0/GUI/dist/
 /o0/GUI/data/

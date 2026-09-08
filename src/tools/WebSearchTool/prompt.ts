@@ -11,6 +11,11 @@ export function getWebSearchPrompt(): string {
 - Use this tool for accessing information beyond Claude's knowledge cutoff
 - Searches are performed automatically within a single API call
 
+CRITICAL — when the user asks to search / look up prices / find current info:
+  - Call WebSearch first with a clear query string (required parameter: query)
+  - Do NOT use WebFetch on google.com/search, bing.com/search, duckduckgo.com, or other SERP URLs
+  - After WebSearch returns links, you may WebFetch specific result pages (articles, stores, wikis)
+
 CRITICAL REQUIREMENT - You MUST follow this:
   - After answering the user's question, you MUST include a "Sources:" section at the end of your response
   - In the Sources section, list all relevant URLs from the search results as markdown hyperlinks: [Title](URL)
@@ -25,7 +30,7 @@ CRITICAL REQUIREMENT - You MUST follow this:
 
 Usage notes:
   - Domain filtering is supported to include or block specific websites
-  - Web search is only available in the US
+  - Prefer WebSearch over inventing URLs or scraping search engines with WebFetch
 
 IMPORTANT - Use the correct year in search queries:
   - The current month is ${currentMonthYear}. You MUST use this year when searching for recent information, documentation, or current events.

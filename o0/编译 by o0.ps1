@@ -16,7 +16,7 @@ $repoRoot = Split-Path -Parent $o0Dir
 $releaseDir = Join-Path $o0Dir "Release"
 $guiSrc = Join-Path $o0Dir "GUI"
 $guiRelease = Join-Path $releaseDir "gui"
-$cacheDir = Join-Path $o0Dir ".cache"
+$cacheDir = Join-Path $o0Dir "Temp"
 
 # Pinned portable Node (win-x64). Bump intentionally when you want a newer runtime.
 $NodeRuntimeVersion = "22.23.2"
@@ -242,6 +242,16 @@ Copy-TreeReplace (Join-Path $guiSrc "server") (Join-Path $guiRelease "server")
 Copy-TreeReplace (Join-Path $guiSrc "dist") (Join-Path $guiRelease "dist")
 Write-Host "  updated GUI package.json, server, dist"
 
+$webSearchSrc = Join-Path $o0Dir "WebSearch"
+$webSearchRelease = Join-Path $releaseDir "WebSearch"
+if (Test-Path $webSearchSrc) {
+  Write-Host "==> Pack WebSearch (SearXNG) into Release\WebSearch"
+  Copy-TreeReplace $webSearchSrc $webSearchRelease
+  Write-Host "  replaced WebSearch"
+} else {
+  Write-Host "==> WebSearch missing — skip ($webSearchSrc)"
+}
+
 $cliLauncher = @"
 @echo off
 REM AI Cursor — OpenClaude CLI using bundled Node
@@ -297,6 +307,8 @@ Write-Host "  Bundled Node: $nodeHome"
 Write-Host ""
 Write-Host "Web GUI (recommended, no TUI):"
 Write-Host "  $releaseDir\OpenClaude-GUI.cmd"
+Write-Host "SearXNG (optional, needs Docker):"
+Write-Host "  $releaseDir\WebSearch\start.cmd"
 Write-Host "CLI TUI (optional):"
 Write-Host "  $releaseDir\openclaude.cmd"
 Write-Host "Force reinstall deps:  powershell -File .\"编译 by o0.ps1" -ForceNpm"

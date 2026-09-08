@@ -62,6 +62,9 @@ const HY3_TOOL_CALL_BLOCK_RE = /<tool_call:[^>\s]+>([\s\S]*?)(?:<\/tool_call(?::
 const XML_FUNCTION_NAME_RE = /<function=([^>\s]+)\s*>/
 const XML_PARAMETER_RE = /<parameter=([^>\s]+)\s*>([\s\S]*?)<\/parameter>/g
 const XML_ARG_PAIR_RE = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g
+/** Qwen sometimes emits Dialect A without a wrapping `<tool_call>` opener. */
+const BARE_FUNCTION_BLOCK_RE =
+  /<function=([^>\s]+)\s*>([\s\S]*?)<\/function>(?:\s*<\/tool_call>)?/g
 export function isHy3Model(model: string): boolean {
   return model.split('?', 1)[0]?.toLowerCase() === 'tencent/hy3'
 }
@@ -225,6 +228,41 @@ export function parseXmlToolCalls(
     ]
     const { name, args } = parseStandardXmlToolCallInner(block[1] ?? '')
     if (!name) continue
+    candidates.push({
+      range,
+      name,
+      args,
+      coveredByWrapper: false,
+    })
+  }
+
+  // Bare `<function=NAME>…</function>` (optionally followed by `</tool_call>`)
+  // when the model omitted the opening `<tool_call>` tag.
+  for (const block of text.matchAll(BARE_FUNCTION_BLOCK_RE)) {
+    const range: [number, number] = [
+      block.index!,
+      block.index! + block[0].length,
+    ]
+    if (
+      candidates.some(
+        c => c.range[0] <= range[0] && range[1] <= c.range[1],
+      )
+    )
+      continue
+    const name = block[1]
+    if (!name || !/^[A-Za-z_][\w.-]*$/.test(name)) continue
+    const inner = block[2] ?? ''
+    const args: Record<string, unknown> = {}
+    let paramCount = 0
+    for (const p of inner.matchAll(XML_PARAMETER_RE)) {
+      const key = p[1]
+      if (!key) continue
+      args[key] = coerceXmlToolValue(p[2] ?? '')
+      paramCount++
+    }
+    // Require at least one <parameter=…> so prose like
+    // "a <function=Foo> tag" without a body is not treated as a call.
+    if (paramCount === 0) continue
     candidates.push({
       range,
       name,

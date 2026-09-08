@@ -271,6 +271,21 @@ describe('parseXmlToolCalls', () => {
     expect(toolCallRanges).toHaveLength(0)
   })
 
+  test('bare <function=…></function> without opener still parses', () => {
+    const text =
+      '<function=ToolSearch><parameter=query>select:WebSearch,WebFetch</parameter></function></tool_call>'
+    const { calls, toolCallRanges } = parseXmlToolCalls(text)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('ToolSearch')
+    expect(calls[0].arguments).toEqual({
+      query: 'select:WebSearch,WebFetch',
+    })
+    expect(toolCallRanges).toHaveLength(1)
+    const stripped =
+      text.slice(0, toolCallRanges[0][0]) + text.slice(toolCallRanges[0][1])
+    expect(stripped.trim()).toBe('')
+  })
+
   test('<tool_call> with no recognizable call → no calls emitted', () => {
     const { calls } = parseXmlToolCalls('<tool_call>garbage with no function</tool_call>')
     expect(calls).toHaveLength(0)

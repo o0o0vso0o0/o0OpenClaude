@@ -10,6 +10,8 @@ import {
   type GeminiStreamDependencies,
 } from './geminiStreamConversion.js'
 import { createProviderStreamTrace } from './streamControl.js'
+import { stripRanges } from './rawToolCallParsing.js'
+import { parseXmlToolCalls as parseXmlToolCallsModule } from './xmlToolCallParsing.js'
 
 function makeSseResponse(frames: unknown[]): Response {
   const encoder = new TextEncoder()
@@ -609,4 +611,101 @@ test('Gemini converter starts an empty message and maps blocked finishes', async
     delta: { stop_reason: 'max_tokens' },
     usage: {},
   })
+})
+
+test('Ollama stream recovers XML tool calls and hides raw markup', async () => {
+  let sequence = 0
+  const xml =
+    '<tool_call><function=Bash><parameter=command>ls -la</parameter></function></tool_call>'
+  const response = makeSseResponse([
+    makeOpenAIChunk({ content: xml }),
+    makeOpenAIChunk({}, 'stop'),
+    '[DONE]',
+  ])
+  const events = await collect(
+    openaiStreamToAnthropic(
+      response,
+      'qwen3:8b',
+      undefined,
+      true,
+      undefined,
+      createStreamDependencies({
+        parseXmlToolCalls: (text, allowHy3) =>
+          parseXmlToolCallsModule(text, !!allowHy3, () => ++sequence),
+        stripRanges,
+      }),
+    ),
+  )
+
+  const toolStarts = events.filter(
+    e =>
+      e.type === 'content_block_start' &&
+      (e as { content_block?: { type?: string } }).content_block?.type ===
+        'tool_use',
+  )
+  expect(toolStarts).toHaveLength(1)
+  expect(
+    (toolStarts[0] as { content_block: { name: string } }).content_block.name,
+  ).toBe('Bash')
+  const text = events
+    .filter(
+      e =>
+        e.type === 'content_block_delta' &&
+        (e as { delta?: { type?: string } }).delta?.type === 'text_delta',
+    )
+    .map(e => (e as { delta: { text: string } }).delta.text)
+    .join('')
+  expect(text).not.toContain('<tool_call>')
+  expect(text).not.toContain('<function=')
+  const stop = events.find(e => e.type === 'message_delta') as {
+    delta: { stop_reason: string }
+  }
+  expect(stop?.delta.stop_reason).toBe('tool_use')
+})
+
+test('Ollama stream recovers bare <function=…> without <tool_call> opener', async () => {
+  let sequence = 0
+  const xml =
+    '<function=ToolSearch><parameter=query>select:WebSearch</parameter></function></tool_call>'
+  const response = makeSseResponse([
+    makeOpenAIChunk({ content: 'Looking up tools.\n' + xml }),
+    makeOpenAIChunk({}, 'stop'),
+    '[DONE]',
+  ])
+  const events = await collect(
+    openaiStreamToAnthropic(
+      response,
+      'qwen3:8b',
+      undefined,
+      true,
+      undefined,
+      createStreamDependencies({
+        parseXmlToolCalls: (text, allowHy3) =>
+          parseXmlToolCallsModule(text, !!allowHy3, () => ++sequence),
+        stripRanges,
+      }),
+    ),
+  )
+
+  const toolStarts = events.filter(
+    e =>
+      e.type === 'content_block_start' &&
+      (e as { content_block?: { type?: string } }).content_block?.type ===
+        'tool_use',
+  )
+  expect(toolStarts).toHaveLength(1)
+  expect(
+    (toolStarts[0] as { content_block: { name: string } }).content_block.name,
+  ).toBe('ToolSearch')
+  const text = events
+    .filter(
+      e =>
+        e.type === 'content_block_delta' &&
+        (e as { delta?: { type?: string } }).delta?.type === 'text_delta',
+    )
+    .map(e => (e as { delta: { text: string } }).delta.text)
+    .join('')
+  expect(text).toContain('Looking up tools.')
+  expect(text).not.toContain('<function=')
+  expect(text).not.toContain('</tool_call>')
 })

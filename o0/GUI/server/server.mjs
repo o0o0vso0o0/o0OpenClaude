@@ -23,6 +23,7 @@ import {
 } from './models-catalog.mjs'
 import { resolveOpenClaudeCli, runAgentTurn, findSessionJsonl } from './agent-harness.mjs'
 import { analyzeSessionJsonl, buildUsageDetail } from './usage-analysis.mjs'
+import { ensureLocalSearxngStarted, stopLocalSearxng } from './websearch-env.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const GUI_ROOT = path.resolve(__dirname, '..')
@@ -77,6 +78,12 @@ function shutdown(reason) {
   }
   shuttingDown = true
   console.log(`[openclaude-gui] shutting down (${reason})`)
+  try {
+    stopLocalSearxng(GUI_ROOT)
+    console.log('[openclaude-gui] WebSearch stopped')
+  } catch (e) {
+    console.warn('[openclaude-gui] WebSearch stop failed:', e?.message || e)
+  }
   if (server)
     server.close(() => process.exit(0))
   else
@@ -102,6 +109,13 @@ const DEFAULT_SETTINGS = {
   planMode: false,
   /** Local Ollama: pass think:true to /api/chat (Qwen3.x) */
   ollamaThink: false,
+  /** Tavily web search API key */
+  tavilyApiKey: '',
+  /**
+   * WebSearch backend: 'local' = SearXNG (Bing/DDG compat), 'tavily' = Tavily API.
+   * Empty = auto (Tavily if key set, else local).
+   */
+  webSearchBackend: '',
   /** @type {Record<string, string>} modelId -> ISO last-used time */
   modelLastUsed: {},
 }
@@ -110,6 +124,13 @@ const DEFAULT_SETTINGS = {
 function isLocalPlaceholderKey(key) {
   const k = String(key || '').trim().toLowerCase()
   return !k || k === 'ollama' || k === 'local' || k === '********'
+}
+
+/// <summary> AI Cursor </summary>
+function normalizeWebSearchBackend(s) {
+  const raw = String(s?.webSearchBackend || '').trim().toLowerCase()
+  if (raw === 'local' || raw === 'tavily') return raw
+  return String(s?.tavilyApiKey || '').trim() ? 'tavily' : 'local'
 }
 
 /// <summary> AI Cursor </summary>
@@ -128,6 +149,8 @@ function settingsPublic(s) {
         ? cloudKey
         : ''
   const cli = resolveOpenClaudeCli(GUI_ROOT)
+  const tavilyKey = String(s.tavilyApiKey || '').trim()
+  const webSearchBackend = normalizeWebSearchBackend(s)
   return {
     baseUrl: s.baseUrl,
     model: s.model,
@@ -141,6 +164,11 @@ function settingsPublic(s) {
       : local
         ? 'local'
         : '',
+    tavilyApiKeySet: Boolean(tavilyKey),
+    tavilyApiKeyPreview: tavilyKey
+      ? `${tavilyKey.slice(0, 8)}…${tavilyKey.slice(-4)}`
+      : '',
+    webSearchBackend,
     provider: local ? 'ollama' : 'openai',
     agentCli: cli?.label || null,
     agentReady: Boolean(cli),
@@ -193,7 +221,9 @@ function ensureDirs() {
 function readSettings() {
   ensureDirs()
   try {
-    const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'))
+    let text = fs.readFileSync(SETTINGS_PATH, 'utf8')
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+    const raw = JSON.parse(text)
     return {
       ...DEFAULT_SETTINGS,
       ...raw,
@@ -583,6 +613,8 @@ app.put('/api/settings', async (req, res) => {
         ? Boolean(body.ollamaThink)
         : Boolean(cur.ollamaThink),
     apiKey: cur.apiKey,
+    tavilyApiKey: cur.tavilyApiKey || '',
+    webSearchBackend: normalizeWebSearchBackend(cur),
     cloudBaseUrl: cur.cloudBaseUrl || DEFAULT_SETTINGS.cloudBaseUrl,
     cloudApiKey: cur.cloudApiKey != null ? cur.cloudApiKey : '',
     localBaseUrl: cur.localBaseUrl || LOCAL_OLLAMA_BASE_URL,
@@ -619,6 +651,18 @@ app.put('/api/settings', async (req, res) => {
       next.apiKey = ''
       next.cloudApiKey = ''
     }
+  }
+  if (typeof body.tavilyApiKey === 'string') {
+    const key = body.tavilyApiKey.trim()
+    if (key && key !== '********') next.tavilyApiKey = key
+  }
+  if (body.clearTavilyApiKey === true) next.tavilyApiKey = ''
+  if (body.webSearchBackend != null) {
+    const mode = String(body.webSearchBackend).trim().toLowerCase()
+    if (mode === 'local' || mode === 'tavily') next.webSearchBackend = mode
+  }
+  if (next.webSearchBackend === 'tavily' && !String(next.tavilyApiKey || '').trim()) {
+    // Choosing Tavily without a key: keep selection but runtime falls back to local.
   }
 
   // Switching model also switches endpoint (local Ollama <-> cloud).
@@ -847,6 +891,7 @@ app.post('/api/chat', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
   res.flushHeaders?.()
 
   let closed = false
@@ -859,6 +904,9 @@ app.post('/api/chat', async (req, res) => {
     try {
       res.write(`event: ${event}\n`)
       res.write(`data: ${JSON.stringify(data)}\n\n`)
+      // Avoid proxy/Node buffering the first tiny SSE frames — otherwise the UI
+      // stays busy with no assistant bubble / wait hint until a large chunk arrives.
+      if (typeof res.flush === 'function') res.flush()
       return true
     } catch (e) {
       closed = true
@@ -876,6 +924,8 @@ app.post('/api/chat', async (req, res) => {
     thinkingText = null,
     activity = null,
     filesChanged = null,
+    segments = null,
+    extras = null,
   ) {
     const promptTokens = Number(usageLike?.promptTokens ?? usageLike?.prompt_tokens) || 0
     const completionTokens =
@@ -889,7 +939,12 @@ app.post('/api/chat', async (req, res) => {
     const { costCa } = calcTokenCostCa(price, promptTokens, completionTokens)
     const priceKnown = costCa != null && hasCounts
 
-    const body = assistantText || '(空回复)'
+    const trimmed = String(assistantText || '').trim()
+    const body = trimmed
+      ? trimmed
+      : thinkingText
+        ? '（模型只完成了思考，未输出正文或工具调用。可关闭 Think 后重试。）'
+        : '(空回复)'
     const footer = hasCounts
       ? buildCostFooter({
           promptTokens,
@@ -910,8 +965,24 @@ app.post('/api/chat', async (req, res) => {
       model: modelId,
       ...(thinkingText ? { thinking: String(thinkingText) } : {}),
       ...(Array.isArray(activity) && activity.length ? { activity } : {}),
+      ...(Array.isArray(segments) && segments.length ? { segments } : {}),
       ...(Array.isArray(filesChanged) && filesChanged.length
         ? { filesChanged }
+        : {}),
+      ...(Array.isArray(extras?.tools) && extras.tools.length
+        ? { tools: extras.tools }
+        : {}),
+      ...(Array.isArray(extras?.webPages) && extras.webPages.length
+        ? { webPages: extras.webPages }
+        : {}),
+      ...(Array.isArray(extras?.filesRead) && extras.filesRead.length
+        ? { filesRead: extras.filesRead }
+        : {}),
+      ...(extras?.promptRecord
+        ? { promptRecord: String(extras.promptRecord) }
+        : {}),
+      ...(extras?.userPrompt != null
+        ? { userPrompt: String(extras.userPrompt) }
         : {}),
       usage: hasCounts
         ? {
@@ -981,6 +1052,8 @@ app.post('/api/chat', async (req, res) => {
       cwd: workCwd,
       model: modelId,
       apiKey: settings.apiKey,
+      tavilyApiKey: settings.tavilyApiKey || '',
+      webSearchBackend: normalizeWebSearchBackend(settings),
       baseUrl,
       resumeSessionId: session.agentSessionId || null,
       configDir,
@@ -990,24 +1063,37 @@ app.post('/api/chat', async (req, res) => {
         if (closed) return
         if (ev.type === 'delta' && ev.text) {
           assistantText += ev.text
-          send('delta', { id: assistantId, text: ev.text })
-        } else if (ev.type === 'tool') {
-          const line = `\n[tool] ${ev.name}${ev.preview ? ` · ${ev.preview}` : ''}\n`
-          assistantText += line
-          send('tool', {
+          send('delta', {
+            id: assistantId,
+            text: ev.text,
+            ...(ev.segmentId ? { segmentId: ev.segmentId } : {}),
+          })
+        } else if (ev.type === 'tool' || ev.type === 'tool_update') {
+          send(ev.type === 'tool_update' ? 'tool_update' : 'tool', {
             id: assistantId,
             toolId: ev.id,
             name: ev.name,
             preview: ev.preview || '',
+            input: ev.input && typeof ev.input === 'object' ? ev.input : {},
+            segmentId: ev.segmentId || undefined,
+            ready: Boolean(ev.ready),
           })
-          send('delta', { id: assistantId, text: line })
         } else if (ev.type === 'status' && ev.text) {
           send('status', { id: assistantId, text: ev.text })
         } else if (ev.type === 'thinking' && ev.text) {
           assistantThinking += ev.text
-          send('thinking', { id: assistantId, text: ev.text })
+          send('thinking', {
+            id: assistantId,
+            text: ev.text,
+            ...(ev.segmentId ? { segmentId: ev.segmentId } : {}),
+          })
         } else if (ev.type === 'thinking_done') {
-          send('thinking_done', { id: assistantId })
+          send('thinking_done', {
+            id: assistantId,
+            ...(ev.segmentId ? { segmentId: ev.segmentId } : {}),
+            ...(typeof ev.ms === 'number' ? { ms: ev.ms } : {}),
+            ...(ev.label ? { label: ev.label } : {}),
+          })
         } else if (ev.type === 'activity' && ev.kind && ev.text) {
           send('activity', {
             id: assistantId,
@@ -1020,6 +1106,16 @@ app.post('/api/chat', async (req, res) => {
           send('files_changed', {
             id: assistantId,
             files: ev.files,
+          })
+        } else if (ev.type === 'files_read' && Array.isArray(ev.files)) {
+          send('files_read', {
+            id: assistantId,
+            files: ev.files,
+          })
+        } else if (ev.type === 'web_pages' && Array.isArray(ev.pages)) {
+          send('web_pages', {
+            id: assistantId,
+            pages: ev.pages,
           })
         }
       },
@@ -1036,6 +1132,14 @@ app.post('/api/chat', async (req, res) => {
         assistantThinking || null,
         result.activity || null,
         result.filesChanged || null,
+        result.segments || null,
+        {
+          tools: result.tools || null,
+          webPages: result.webPages || null,
+          filesRead: result.filesRead || null,
+          promptRecord: result.promptRecord || null,
+          userPrompt: result.userPrompt || text,
+        },
       )
   } catch (err) {
     console.error('[openclaude-gui] chat error:', err)
@@ -1070,7 +1174,7 @@ process.on('unhandledRejection', err => {
 })
 
 server = http.createServer(app)
-server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, async () => {
   const url = `http://${HOST}:${PORT}`
   console.log(`[openclaude-gui] listening on ${url}`)
   console.log(`[openclaude-gui] data dir: ${DATA_DIR}`)
@@ -1078,6 +1182,19 @@ server.listen(PORT, HOST, () => {
   console.log(
     `[openclaude-gui] agent CLI: ${cli ? cli.label : 'NOT FOUND — agent mode unavailable'}`,
   )
+  try {
+    const ws = await ensureLocalSearxngStarted(GUI_ROOT)
+    if (ws?.ok)
+      console.log(
+        `[openclaude-gui] WebSearch ready (${ws.mode}) http://127.0.0.1:${ws.port}/search`,
+      )
+    else
+      console.warn(
+        `[openclaude-gui] WebSearch not ready: ${ws?.reason || 'unknown'}`,
+      )
+  } catch (e) {
+    console.warn('[openclaude-gui] WebSearch start skipped:', e?.message || e)
+  }
   if (DEV)
     console.log('[openclaude-gui] DEV mode: start UI with npm run dev:ui (proxied to this API)')
   if (LIFETIME)
